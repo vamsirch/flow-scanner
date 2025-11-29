@@ -1,11 +1,8 @@
 import streamlit as st
 import pandas as pd
-from polygon import RESTClient, WebSocketClient
-from polygon.websocket.models import WebSocketMessage
-import threading
+from polygon import RESTClient
 import time
-import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 
 # --- PAGE CONFIG ---
@@ -14,8 +11,6 @@ st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
     st.session_state["scanner_data"] = deque(maxlen=1000)
-if "running" not in st.session_state:
-    st.session_state["running"] = False
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
@@ -30,28 +25,13 @@ with st.sidebar:
     if api_input:
         st.session_state["api_key"] = api_input
 
-    st.caption("v1.0.0 | Institutional Analytics")
-
 # ==========================================
 # PAGE 1: HOME
 # ==========================================
 def render_home():
     st.title("Welcome to FlowTrend Pro")
     st.write("### Institutional Options Analytics Terminal")
-    
-    st.info("""
-    **How to use this dashboard:**
-    
-    1. **Enter your Polygon API Key** in the sidebar (left).
-    2. **Use the Radio Buttons** above the key to switch tools:
-       * **🔍 Contract Inspector:** Analyze individual option contracts, charts, and Greeks.
-       * **⚡ Live Whale Scanner:** Watch for real-time Block Trades and Sweeps.
-    """)
-    
-    if st.session_state["api_key"]:
-        st.success("✅ API Key detected. Select a tool from the sidebar to begin!")
-    else:
-        st.warning("⬅️ Please enter your API Key in the sidebar to unlock the tools.")
+    st.info("Select a tool from the sidebar to begin.")
 
 # ==========================================
 # PAGE 2: CONTRACT INSPECTOR
@@ -65,30 +45,34 @@ def render_inspector():
         return
 
     client = RESTClient(api_key)
-    
-    # Layout
     c1, c2 = st.columns([1, 3])
     
     with c1:
         st.subheader("1. Setup")
-        tickers = ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"]
-        target = st.selectbox("Ticker", tickers)
+        target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
-        # Price Check
+        # --- ROBUST PRICE CHECK ---
         try:
             snap = client.get_snapshot_ticker("stocks", target)
-            price = snap.last_trade.price if snap.last_trade else snap.day.close
-            st.info(f"📍 {target}: ${price:.2f}")
-        except:
+            if snap and snap.last_trade:
+                price = snap.last_trade.price
+                st.success(f"📍 {target}: ${price:.2f}")
+            elif snap and snap.day:
+                price = snap.day.close
+                st.info(f"📍 {target}: ${price:.2f} (Close)")
+            else:
+                price = 0
+                st.warning("No price data found.")
+        except Exception as e:
             price = 0
-            st.warning("Connecting...")
+            st.error(f"Price Error: {e}")
             
         expiry = st.date_input("Expiration", value=datetime.now().date())
         side = st.radio("Side", ["Call", "Put"], horizontal=True)
         
         st.write("---")
         
-        # Strike Logic
+        # --- STRIKE LOGIC ---
         try:
             contracts = client.list_options_contracts(
                 underlying_ticker=target,
@@ -113,7 +97,7 @@ def render_inspector():
             else:
                 st.error("No strikes found.")
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Strike Error: {e}")
 
     with c2:
         if 'active_sym' in st.session_state:
@@ -123,8 +107,10 @@ def render_inspector():
                 snap = client.get_snapshot_option(target, sym)
                 if snap:
                     m1, m2, m3, m4 = st.columns(4)
+                    # Handle missing trade data safely
                     p = snap.last_trade.price if snap.last_trade else (snap.day.close if snap.day else 0)
                     v = snap.day.volume if snap.day else 0
+                    
                     m1.metric("💰 Price", f"${p}", f"Vol: {v}")
                     if snap.greeks:
                         m2.metric("Delta", f"{snap.greeks.delta:.2f}")
@@ -133,14 +119,15 @@ def render_inspector():
                     st.write("### ⚡ Intraday Chart")
                     today = datetime.now().strftime("%Y-%m-%d")
                     aggs = client.get_aggs(sym, 5, "minute", today, today)
+                    
                     if aggs:
                         df = pd.DataFrame(aggs)
                         df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
                         st.area_chart(df.set_index('Time')['close'], color="#00FF00")
                     else:
-                        st.info("No trades today.")
-            except:
-                st.error("Data load failed.")
+                        st.info("No trades today (Market closed or illiquid).")
+            except Exception as e:
+                st.error(f"Data Load Error: {e}")
 
 # ==========================================
 # PAGE 3: LIVE SCANNER
@@ -153,18 +140,7 @@ def render_scanner():
         st.error("Please enter API Key in the sidebar.")
         return
 
-    # Controls
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ"], default=["NVDA", "TSLA"])
-    with col2:
-        min_val = st.number_input("Min $ Value", value=10_000, step=5_000)
-    with col3:
-        st.write("") # Spacer
-        if st.button("🔄 Refresh / Scan"):
-            scan_market(api_key, watch, min_val)
-
-    # Scan Logic (Manual Refresh for Stability)
+    # --- 1. DEFINE SCAN FUNCTION FIRST (Fixes the Error) ---
     def scan_market(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
@@ -173,7 +149,10 @@ def render_scanner():
         for t in tickers:
             try:
                 status.write(f"Checking {t}...")
-                chain = client.list_snapshot_options_chain(t, params={"limit": 50, "sort": "day_volume", "order": "desc"})
+                chain = client.list_snapshot_options_chain(
+                    t, 
+                    params={"limit": 50, "sort": "day_volume", "order": "desc"}
+                )
                 for c in chain:
                     if c.day and c.day.volume and c.day.close:
                         flow = c.day.close * c.day.volume * 100
@@ -187,18 +166,30 @@ def render_scanner():
                                 "Value": flow,
                                 "Time": "Day Sum"
                             })
-            except:
+            except Exception as e:
+                st.warning(f"Error scanning {t}: {e}")
                 continue
         
         status.update(label="Scan Complete", state="complete", expanded=False)
         st.session_state["scanner_data"] = new_data
 
-    # Display Table
+    # --- 2. CONTROLS ---
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ"], default=["NVDA"])
+    with col2:
+        min_val = st.number_input("Min $ Value", value=10_000, step=5_000)
+    with col3:
+        st.write("") # Spacer
+        # --- 3. BUTTON CALLS FUNCTION ---
+        if st.button("🔄 Refresh / Scan"):
+            scan_market(api_key, watch, min_val)
+
+    # --- 4. DISPLAY ---
     data = st.session_state["scanner_data"]
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Style
         def style_rows(row):
             c = '#d4f7d4' if row['Side'] == 'CALL' else '#f7d4d4'
             return [f'background-color: {c}; color: black'] * len(row)
