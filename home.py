@@ -20,20 +20,13 @@ if "api_key" not in st.session_state:
 
 # --- HELPER: PARSE SYMBOL ---
 def parse_details(symbol):
-    """Extracts nice looking details from the ugly symbol"""
     try:
-        # Regex: O:Ticker + Date + Type + Price
         match = re.match(r"O:([A-Z]+)(\d{6})([CP])(\d{8})", symbol)
         if match:
             ticker, date_str, type_char, strike_str = match.groups()
-            
-            # Date: 251205 -> 2025-12-05
             expiry = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
-            
-            # Strike: 00180000 -> 180.00 (Forced 2 decimals)
             strike_val = float(strike_str) / 1000.0
-            strike_display = f"${strike_val:,.2f}" 
-            
+            strike_display = f"${strike_val:,.2f}"
             side = "Call" if type_char == 'C' else "Put"
             return ticker, expiry, strike_display, side
     except:
@@ -70,10 +63,8 @@ def render_inspector():
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
-        # --- FIXED: SILENT STOCK PRICE (No Red Box) ---
         price = 0
         try:
-            # Try Real-Time (Will fail on your plan, that's okay)
             snap = client.get_snapshot_ticker("stocks", target)
             if snap and snap.last_trade:
                 price = snap.last_trade.price
@@ -82,14 +73,12 @@ def render_inspector():
                 price = snap.day.close
                 st.info(f"📍 {target}: ${price:.2f} (Close)")
         except:
-            # Fallback to Previous Close (Free Plan)
             try:
                 prev = client.get_previous_close_agg(target)
                 if prev:
                     price = prev[0].close
-                    st.info(f"📍 {target}: ${price:.2f} (Prev Close)")
-            except:
-                st.warning("Price Unavailable")
+                    st.info(f"📍 {target}: ${price:.2f} (Prev)")
+            except: st.warning("Price Unavailable")
             
         expiry = st.date_input("Expiration", value=datetime.now().date())
         side = st.radio("Side", ["Call", "Put"], horizontal=True)
@@ -112,7 +101,7 @@ def render_inspector():
             else:
                 st.error("No strikes found.")
         except Exception as e:
-            st.error(f"Strike Error: {e}")
+            st.error(f"API Error: {e}")
 
     with c2:
         if 'active_sym' in st.session_state:
@@ -149,8 +138,7 @@ def render_inspector():
                         st.area_chart(df.set_index('Time')['close'], color="#00FF00")
                     else:
                         st.info("No trades today.")
-            except:
-                st.error("Data Load Error")
+            except: st.error("Data Load Error")
 
 # ==========================================
 # PAGE 3: LIVE SCANNER
@@ -174,22 +162,21 @@ def render_scanner():
                 ticker_contracts = []
                 for c in chain:
                     if c.day and c.day.volume and c.day.close:
-                        flow = c.day.close * c.day.volume * 100
-                        if flow >= threshold:
+                        # Value = Premium
+                        val = c.day.close * c.day.volume * 100
+                        if val >= threshold:
                             side = "Call" if c.details.contract_type == "call" else "Put"
-                            
-                            # FIXED: Formatted Strike $180.00
                             strike_fmt = f"${c.details.strike_price:,.2f}"
                             
                             ticker_contracts.append({
                                 "Symbol": t,
-                                "Strike": strike_fmt, 
+                                "Strike": strike_fmt,
                                 "Expiry": c.details.expiration_date,
                                 "Side": side,
-                                "Vol": c.day.volume,
-                                "Value": flow,
+                                "Size": c.day.volume,
+                                "Value": val,  # Raw float for sorting
                                 "Time": "Day Sum",
-                                "Tags": "📊 HISTORICAL"
+                                "Tags": "📊 DAY VOL"
                             })
                 ticker_contracts.sort(key=lambda x: x["Value"], reverse=True)
                 new_data.extend(ticker_contracts[:20])
@@ -210,21 +197,19 @@ def render_scanner():
                         found = next((t for t in tickers if t in m.symbol), None)
                         if not found: continue
 
-                        flow = m.price * m.size * 100
-                        if flow >= threshold:
-                            # FIXED: Parse Symbol for Clean Details
+                        val = m.price * m.size * 100
+                        if val >= threshold:
                             _, expiry, strike, side = parse_details(m.symbol)
-                            
                             conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
                             tag = "🧹 SWEEP" if 14 in conds else "⚡ LIVE"
                             
                             st.session_state["scanner_data"].appendleft({
                                 "Symbol": found,
-                                "Strike": strike, # Now looks like $180.00
+                                "Strike": strike,
                                 "Expiry": expiry,
                                 "Side": side,
-                                "Vol": m.size,
-                                "Value": flow,
+                                "Size": m.size,
+                                "Value": val, # Raw float for sorting
                                 "Time": time.strftime("%H:%M:%S"),
                                 "Tags": tag
                             })
@@ -238,7 +223,7 @@ def render_scanner():
     with col1:
         watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
     with col2:
-        min_val = st.number_input("Min Premium ($)", value=20_000, step=10_000)
+        min_val = st.number_input("Min $ Value", value=20_000, step=10_000)
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
@@ -249,10 +234,13 @@ def render_scanner():
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
                 t.start()
 
-    # --- 4. DISPLAY ---
+    # --- 4. DISPLAY (SORTED BY VALUE) ---
     data = list(st.session_state["scanner_data"])
     if len(data) > 0:
         df = pd.DataFrame(data)
+        
+        # --- CRITICAL FIX: SORT BY VALUE (DESCENDING) ---
+        df = df.sort_values(by="Value", ascending=False)
         
         def style_rows(row):
             c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
@@ -260,13 +248,12 @@ def render_scanner():
             return [f'background-color: {c}; color: black'] * len(row)
             
         st.dataframe(
-            df.style.apply(style_rows, axis=1).format({"Premium": "${:,.0f}"}),
+            df.style.apply(style_rows, axis=1).format({"Value": "${:,.0f}"}),
             use_container_width=True,
             height=800,
             column_config={
-                # FIXED: Force whole dollar format (No decimals)
-                "Value": st.column_config.ProgressColumn("Dollar Amount", format="$%.0f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
-                "Vol": st.column_config.NumberColumn("Size / Vol", format="%d"),
+                "Value": st.column_config.ProgressColumn("$ Value", format="$%.0f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
+                "Size": st.column_config.NumberColumn("Trade Size", format="%d"),
             },
             hide_index=True
         )
