@@ -12,11 +12,6 @@ from collections import deque
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
-# --- 1. CRITICAL FIX: CLEAR OLD CACHE ON RELOAD ---
-if "init_done" not in st.session_state:
-    st.session_state.clear()
-    st.session_state["init_done"] = True
-
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
     st.session_state["scanner_data"] = deque(maxlen=2000)
@@ -31,9 +26,8 @@ def parse_details(symbol):
             ticker, date_str, type_char, strike_str = match.groups()
             expiry = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
             strike_val = float(strike_str) / 1000.0
-            strike_display = f"${strike_val:,.2f}"
             side = "Call" if type_char == 'C' else "Put"
-            return ticker, expiry, strike_display, side
+            return ticker, expiry, f"${strike_val:,.2f}", side
     except:
         pass
     return symbol, "-", "-", "-"
@@ -154,7 +148,7 @@ def render_scanner():
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. DEEP TRADE MINER (Iterates Trades, Not Snapshots) ---
+    # --- 1. CRASH-PROOF DEEP MINER ---
     def run_deep_miner(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
@@ -164,34 +158,38 @@ def render_scanner():
             try:
                 status.write(f"⛏️ Digging into {t}...")
                 
-                # 1. Find HOT Contracts (Snapshot)
-                # We limit to Top 20 contracts to keep API calls reasonable
-                chain = client.list_snapshot_options_chain(t, params={"limit": 20, "sort": "day_volume", "order": "desc"})
-                hot_contracts = []
-                for c in chain:
-                    # Only look at contracts with enough volume to hide a whale
-                    if c.day and (c.day.volume * c.day.close * 100 > threshold):
-                        hot_contracts.append(c.details.ticker)
+                # 1. FETCH BROAD SNAPSHOT (No Sorting Params to avoid 400 Error)
+                # We pull 500 contracts to ensure we catch the active ones
+                chain = client.list_snapshot_options_chain(t, params={"limit": 500})
                 
-                # 2. Extract Individual Trades for each Hot Contract
+                # 2. PYTHON SORT (Safety)
+                # We manually find the contracts with the highest volume TODAY
+                contract_list = []
+                for c in chain:
+                    if c.day and c.day.volume:
+                        contract_list.append(c)
+                
+                # Sort by Volume Descending
+                contract_list.sort(key=lambda x: x.day.volume, reverse=True)
+                
+                # Pick the Top 15 Hottest Contracts to drill into
+                hot_contracts = [c.details.ticker for c in contract_list[:15]]
+                
+                status.write(f"🔎 Scanning Top 15 contracts for {t}...")
+
+                # 3. DRILL DOWN (Fetch Trades)
                 for contract_sym in hot_contracts:
                     try:
-                        # Fetch last 50 trades for this specific contract
                         trades = client.list_trades(contract_sym, limit=50)
-                        
                         _, expiry, strike, side = parse_details(contract_sym)
                         
                         for tr in trades:
-                            # Calculate individual trade value
+                            # Individual Trade Value
                             val = tr.price * tr.size * 100
                             
                             if val >= threshold:
-                                # Clean Time
                                 ts = datetime.fromtimestamp(tr.participant_timestamp / 1e9).strftime('%H:%M:%S')
-                                
-                                # Tag Logic
                                 tag = "🧱 BLOCK"
-                                # Basic logic: if size > 1000 it's likely a block
                                 if tr.size > 1000: tag = "🐋 WHALE"
                                 
                                 new_data.append({
@@ -199,25 +197,26 @@ def render_scanner():
                                     "Strike": strike,
                                     "Expiry": expiry,
                                     "Side": side,
-                                    "Size": tr.size,      # Real Trade Size (e.g. 500)
-                                    "Value": val,         # Real Trade Value (e.g. $150k)
-                                    "Time": ts,           # Exact Time
+                                    "Trade Size": tr.size,      
+                                    "Trade Value": val,         
+                                    "Time": ts,
                                     "Tags": tag
                                 })
                     except: continue
                     
-            except: continue
+            except Exception as e:
+                # Actually show the error this time so we know if it fails
+                status.warning(f"Error scanning {t}: {e}")
+                continue
         
-        # Sort by Time Descending (Newest First)
+        # Final Sort by Time
         new_data.sort(key=lambda x: x["Time"], reverse=True)
         
         status.update(label=f"Mining Complete! Found {len(new_data)} specific trades.", state="complete", expanded=False)
-        
-        # Overwrite state with granular data
         st.session_state["scanner_data"].clear()
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET (REAL TRADES) ---
+    # --- 2. WEBSOCKET ---
     def start_listener(key, tickers, threshold):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
@@ -233,69 +232,6 @@ def render_scanner():
                         if val >= threshold:
                             _, expiry, strike, side = parse_details(m.symbol)
                             conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
-                            
-                            # Detect Sweep
                             tag = "🧹 SWEEP" if 14 in conds else "⚡ LIVE"
                             
-                            st.session_state["scanner_data"].appendleft({
-                                "Symbol": found,
-                                "Strike": strike,
-                                "Expiry": expiry,
-                                "Side": side,
-                                "Size": m.size,
-                                "Value": val,
-                                "Time": time.strftime("%H:%M:%S"),
-                                "Tags": tag
-                            })
-                    except: continue
-
-        ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
-        ws.run(handle_msg)
-
-    # --- 3. CONTROLS ---
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
-    with col2:
-        min_val = st.number_input("Min Trade Value ($)", value=20_000, step=10_000)
-    with col3:
-        st.write("") 
-        if st.button("🔄 Start / Refresh"):
-            run_deep_miner(api_key, watch, min_val)
-            if "thread_started" not in st.session_state:
-                st.session_state["thread_started"] = True
-                t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
-                t.start()
-
-    # --- 4. DISPLAY ---
-    data = list(st.session_state["scanner_data"])
-    if len(data) > 0:
-        df = pd.DataFrame(data)
-        
-        # Sort by Value Descending
-        df = df.sort_values(by="Value", ascending=False)
-        
-        def style_rows(row):
-            c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
-            if "SWEEP" in row['Tags']: return [f'background-color: {c}; font-weight: bold; border-left: 4px solid #gold'] * len(row)
-            return [f'background-color: {c}; color: black'] * len(row)
-            
-        st.dataframe(
-            df.style.apply(style_rows, axis=1).format({"Value": "${:,.0f}"}),
-            use_container_width=True,
-            height=800,
-            column_config={
-                "Value": st.column_config.ProgressColumn("Trade Value", format="$%.0f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
-                "Size": st.column_config.NumberColumn("Trade Size", format="%d"),
-            },
-            hide_index=True
-        )
-    else:
-        st.info("Click 'Start / Refresh' to mine trades.")
-
-# ==========================================
-# ROUTER
-# ==========================================
-if page == "🏠 Home": render_home()
-elif page == "🔍 Contract Inspector": render_inspector()
-elif page == "⚡ Live Whale Scanner": render_scanner()
+                            st.session_state
