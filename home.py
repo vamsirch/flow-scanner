@@ -5,7 +5,7 @@ from polygon.websocket.models import WebSocketMessage
 import threading
 import time
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 
 # --- PAGE CONFIG ---
@@ -13,14 +13,17 @@ st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
-    # Increased buffer to hold more trades
     st.session_state["scanner_data"] = deque(maxlen=2000)
+if "ws_status" not in st.session_state:
+    st.session_state["ws_status"] = "🔴 Disconnected"
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
 # --- SIDEBAR NAVIGATION ---
 with st.sidebar:
     st.title("🐋 FlowTrend AI")
+    st.caption(f"Status: {st.session_state['ws_status']}")
+    
     page = st.radio("Navigate", ["🏠 Home", "🔍 Contract Inspector", "⚡ Live Whale Scanner"])
     st.divider()
     
@@ -53,7 +56,8 @@ def render_inspector():
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
-        # Price Check (With Fallback)
+        # --- SILENT PRICE CHECK ---
+        price = 0
         try:
             snap = client.get_snapshot_ticker("stocks", target)
             if snap and snap.last_trade:
@@ -62,18 +66,21 @@ def render_inspector():
             elif snap and snap.day:
                 price = snap.day.close
                 st.info(f"📍 {target}: ${price:.2f} (Close)")
-            else:
-                price = 0
-                st.warning("No price data found.")
         except:
-            price = 0
+            try:
+                prev = client.get_previous_close_agg(target)
+                if prev:
+                    price = prev[0].close
+                    st.info(f"📍 {target}: ${price:.2f} (Prev)")
+            except:
+                st.warning("Price Unavailable")
             
         expiry = st.date_input("Expiration", value=datetime.now().date())
         side = st.radio("Side", ["Call", "Put"], horizontal=True)
         
         st.write("---")
         
-        # Strike Fetcher
+        # --- STRIKE FETCH ---
         try:
             contracts = client.list_options_contracts(
                 underlying_ticker=target,
@@ -107,6 +114,7 @@ def render_inspector():
                 snap = client.get_snapshot_option(target, sym)
                 if snap:
                     m1, m2, m3, m4 = st.columns(4)
+                    # Handle missing trade data safely
                     p = snap.last_trade.price if snap.last_trade else (snap.day.close if snap.day else 0)
                     v = snap.day.volume if snap.day else 0
                     
@@ -126,6 +134,15 @@ def render_inspector():
                             chart_data = aggs
                     except:
                         pass
+
+                    if not chart_data:
+                        try:
+                            start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+                            aggs = client.get_aggs(sym, 1, "day", start, today)
+                            if aggs:
+                                chart_data = aggs
+                        except:
+                            pass
 
                     if chart_data:
                         df = pd.DataFrame(chart_data)
@@ -147,59 +164,52 @@ def render_scanner():
         st.error("Please enter API Key in the sidebar.")
         return
 
-    # --- 1. FIXED BACKFILL FUNCTION ---
+    # --- 1. BACKFILL (Historical Data) ---
     def run_backfill(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Downloading trade history (This takes a moment)...", expanded=True)
+        status = st.status("⏳ Loading Day's Summary...", expanded=True)
         
         for t in tickers:
             try:
-                status.write(f"📥 Analyzing {t}...")
-                
-                # FIX: Remove 'sort' param (it caused the error). 
-                # We fetch contracts and sort in Python.
+                status.write(f"📥 Fetching Top Volume for {t}...")
                 chain = client.list_snapshot_options_chain(t, params={"limit": 250})
                 
                 ticker_contracts = []
                 for c in chain:
-                    # Filter for active contracts only
                     if c.day and c.day.volume and c.day.close:
                         flow = c.day.close * c.day.volume * 100
-                        
                         if flow >= threshold:
                             side = "Call" if c.details.contract_type == "call" else "Put"
-                            
                             ticker_contracts.append({
                                 "Stock Symbol": t,
-                                "Strike Price": c.details.strike_price,
+                                "Strike Price": f"${c.details.strike_price}",
                                 "Call or Put": side,
                                 "Contract Volume": c.day.volume,
                                 "Dollar Amount": flow,
                                 "Tags": "📊 HISTORICAL"
                             })
                 
-                # Sort by Dollar Amount (Descending) and take Top 20 per ticker
+                # Sort manually by Dollar Amount
                 ticker_contracts.sort(key=lambda x: x["Dollar Amount"], reverse=True)
-                new_data.extend(ticker_contracts[:20])
+                new_data.extend(ticker_contracts[:20]) 
                 
             except Exception as e:
-                status.warning(f"Skipping {t}: {e}")
                 continue
         
-        status.update(label=f"Done! Loaded {len(new_data)} whales.", state="complete", expanded=False)
-        
-        # Update Session State
+        status.update(label=f"Backfill Complete! Loaded {len(new_data)} contracts.", state="complete", expanded=False)
         for row in new_data:
             st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET LISTENER ---
+    # --- 2. LIVE WEBSOCKET LISTENER ---
     def start_listener(key, tickers, threshold):
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
 
         def handle_msg(msgs: list[WebSocketMessage]):
+            st.session_state["ws_status"] = "🟢 Connected" # Update status
+            
             for m in msgs:
                 if m.event_type == "T":
                     try:
@@ -210,13 +220,12 @@ def render_scanner():
                         if flow >= threshold:
                             side = "Call" if "C" in m.symbol else "Put"
                             
-                            # Check conditions for Sweep
                             conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
                             tag = "🧹 SWEEP" if 14 in conds else "⚡ LIVE"
                             
                             st.session_state["scanner_data"].appendleft({
                                 "Stock Symbol": found,
-                                "Strike Price": "Live Print", # Strike parsing is complex on live feed
+                                "Strike Price": "Live Print", 
                                 "Call or Put": side,
                                 "Contract Volume": m.size,
                                 "Dollar Amount": flow,
@@ -224,36 +233,42 @@ def render_scanner():
                             })
                     except: continue
 
-        # Run in background
-        ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
-        ws.run(handle_msg)
+        # AUTO-RECONNECT LOOP
+        while True:
+            try:
+                st.session_state["ws_status"] = "🟡 Connecting..."
+                ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
+                ws.run(handle_msg)
+            except Exception as e:
+                st.session_state["ws_status"] = "🔴 Error (Retrying...)"
+                time.sleep(2) # Wait before retry
 
     # --- 3. CONTROLS ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
     with col2:
-        min_val = st.number_input("Min $ Amount", value=20_000, step=10_000)
+        min_val = st.number_input("Min $ Amount", value=10_000, step=5_000)
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
-            # Clear old data
             st.session_state["scanner_data"].clear()
             
-            # 1. Run Backfill (Snapshot)
+            # Run Backfill
             run_backfill(api_key, watch, min_val)
             
-            # 2. Start Live Listener (Threaded)
-            # Note: In this simple structure, we rely on Backfill for immediate data. 
-            # A full background thread would require the complex setup from previous steps.
-            # For now, this button re-scans the market snapshot which is robust.
+            # Start Live Thread (if not already running)
+            # Note: We use a simple check to avoid duplicate threads
+            if "thread_started" not in st.session_state:
+                st.session_state["thread_started"] = True
+                t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
+                t.start()
 
     # --- 4. DISPLAY ---
     data = list(st.session_state["scanner_data"])
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Color Styling
         def style_rows(row):
             c = '#d4f7d4' if row['Call or Put'] == 'Call' else '#f7d4d4'
             return [f'background-color: {c}; color: black'] * len(row)
@@ -268,6 +283,11 @@ def render_scanner():
             },
             hide_index=True
         )
+        
+        # Auto-refresh UI every 2 seconds to show new rows
+        time.sleep(2)
+        st.rerun()
+        
     else:
         st.info("Click 'Start / Refresh' to scan for whales.")
 
