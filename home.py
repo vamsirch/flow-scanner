@@ -30,9 +30,9 @@ def parse_details(symbol):
             # Date: 251205 -> 2025-12-05
             expiry = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
             
-            # Strike: 00180000 -> 180.00
+            # Strike: 00180000 -> 180.00 (Forced 2 decimals)
             strike_val = float(strike_str) / 1000.0
-            strike_display = f"${strike_val:,.2f}" # Force 2 decimals ($0.50, $180.00)
+            strike_display = f"${strike_val:,.2f}" 
             
             side = "Call" if type_char == 'C' else "Put"
             return ticker, expiry, strike_display, side
@@ -168,7 +168,7 @@ def render_scanner():
         
         for t in tickers:
             try:
-                status.write(f"📥 Fetching Top Volume for {t}...")
+                status.write(f"📥 Analyzing {t}...")
                 chain = client.list_snapshot_options_chain(t, params={"limit": 250})
                 
                 ticker_contracts = []
@@ -178,12 +178,12 @@ def render_scanner():
                         if flow >= threshold:
                             side = "Call" if c.details.contract_type == "call" else "Put"
                             
-                            # Format Strike nicely here too
+                            # FIXED: Formatted Strike $180.00
                             strike_fmt = f"${c.details.strike_price:,.2f}"
                             
                             ticker_contracts.append({
                                 "Symbol": t,
-                                "Strike": strike_fmt, # Fixed Format
+                                "Strike": strike_fmt, 
                                 "Expiry": c.details.expiration_date,
                                 "Side": side,
                                 "Vol": c.day.volume,
@@ -212,7 +212,7 @@ def render_scanner():
 
                         flow = m.price * m.size * 100
                         if flow >= threshold:
-                            # Parse Symbol for Clean Details
+                            # FIXED: Parse Symbol for Clean Details
                             _, expiry, strike, side = parse_details(m.symbol)
                             
                             conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
@@ -260,13 +260,13 @@ def render_scanner():
             return [f'background-color: {c}; color: black'] * len(row)
             
         st.dataframe(
-            df.style.apply(style_rows, axis=1),
+            df.style.apply(style_rows, axis=1).format({"Premium": "${:,.0f}"}),
             use_container_width=True,
             height=800,
             column_config={
-                # Fixes the .99999 issue: Uses %.0f to round to whole dollars
+                # FIXED: Force whole dollar format (No decimals)
                 "Value": st.column_config.ProgressColumn("Dollar Amount", format="$%.0f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
-                "Vol": st.column_config.NumberColumn("Contract Volume", format="%d"),
+                "Vol": st.column_config.NumberColumn("Size / Vol", format="%d"),
             },
             hide_index=True
         )
