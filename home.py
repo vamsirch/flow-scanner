@@ -256,4 +256,26 @@ def render_scanner():
         
         def style_rows(row):
             c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
-            if "SWEEP" in row['Tags']: return [f'background-color
+            if "SWEEP" in row['Tags']: return [f'background-color: {c}; font-weight: bold; border-left: 4px solid #gold'] * len(row)
+            return [f'background-color: {c}; color: black'] * len(row)
+            
+        st.dataframe(
+            df.style.apply(style_rows, axis=1),
+            use_container_width=True,
+            height=800,
+            column_config={
+                # Fixes the .99999 issue: Uses %.0f to round to whole dollars
+                "Value": st.column_config.ProgressColumn("Dollar Amount", format="$%.0f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
+                "Vol": st.column_config.NumberColumn("Contract Volume", format="%d"),
+            },
+            hide_index=True
+        )
+    else:
+        st.info("Click 'Start / Refresh' to scan.")
+
+# ==========================================
+# ROUTER
+# ==========================================
+if page == "🏠 Home": render_home()
+elif page == "🔍 Contract Inspector": render_inspector()
+elif page == "⚡ Live Whale Scanner": render_scanner()
