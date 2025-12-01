@@ -18,20 +18,35 @@ if "scanner_data" not in st.session_state:
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
+# --- HELPER: FORMATTING ---
+def format_currency(val):
+    return f"${val:,.0f}"
+
+def format_strike(val):
+    try:
+        return f"${float(val):,.2f}"
+    except:
+        return val
+
 # --- HELPER: PARSE SYMBOL ---
 def parse_details(symbol):
+    """Extracts clean details from O:NVDA251205C00185000"""
     try:
         match = re.match(r"O:([A-Z]+)(\d{6})([CP])(\d{8})", symbol)
         if match:
             ticker, date_str, type_char, strike_str = match.groups()
+            
+            # Expiry: 251205 -> 2025-12-05
             expiry = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
+            
+            # Strike: 00185000 -> 185.00
             strike_val = float(strike_str) / 1000.0
-            strike_display = f"${strike_val:,.2f}"
+            
             side = "Call" if type_char == 'C' else "Put"
-            return ticker, expiry, strike_display, side
+            return ticker, expiry, strike_val, side
     except:
         pass
-    return symbol, "-", "-", "-"
+    return symbol, "-", 0.0, "-"
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -63,6 +78,7 @@ def render_inspector():
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
+        # Silent Price Check
         price = 0
         try:
             snap = client.get_snapshot_ticker("stocks", target)
@@ -148,64 +164,62 @@ def render_scanner():
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. DEEP BACKFILL (Fetches INDIVIDUAL TRADES) ---
-    def run_deep_backfill(key, tickers, threshold):
+    # --- 1. DEEP TRADE SCANNER (Not Snapshot) ---
+    def run_deep_scan(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Deep Scanning: Fetching Individual Trades...", expanded=True)
+        status = st.status("⏳ Hunting individual whale trades...", expanded=True)
         
         for t in tickers:
             try:
-                status.write(f"🔎 Scanning {t}...")
+                status.write(f"🔎 Scanning active contracts for {t}...")
                 
-                # Step 1: Get Top 10 Most Active Contracts (Snapshot)
-                # We can't query trades for ALL contracts, so we pick the hottest ones
-                chain = client.list_snapshot_options_chain(t, params={"limit": 50})
-                active_contracts = []
+                # 1. Get List of Active Contracts (Snapshot)
+                # We limit to Top 20 most active contracts to save time
+                chain = client.list_snapshot_options_chain(t, params={"limit": 20})
+                
+                # 2. For EACH active contract, get ACTUAL TRADES
                 for c in chain:
-                    if c.day and c.day.volume:
-                        active_contracts.append(c.details.ticker)
-                
-                # Step 2: For each active contract, fetch REAL individual trades
-                # Limit to top 5 contracts to save time/API calls
-                for contract_sym in active_contracts[:5]:
+                    if not c.day or not c.day.volume: continue
+                    
+                    # Optimization: If total day volume * price < threshold, skip it entirely
+                    if (c.day.volume * c.day.close * 100) < threshold: continue
+                    
                     try:
                         # Fetch last 10 trades for this specific contract
-                        trades = client.list_trades(contract_sym, limit=10)
+                        trades = client.list_trades(c.details.ticker, limit=10)
                         
-                        _, expiry, strike, side = parse_details(contract_sym)
+                        _, expiry, strike, side = parse_details(c.details.ticker)
                         
-                        for trade in trades:
-                            trade_val = trade.price * trade.size * 100
+                        for tr in trades:
+                            # REAL TRADE VALUE = Price * Size * 100
+                            trade_val = tr.price * tr.size * 100
+                            
                             if trade_val >= threshold:
-                                # Convert TS to readable time
-                                trade_time = datetime.fromtimestamp(trade.participant_timestamp / 1e9).strftime('%H:%M:%S')
+                                # Convert timestamp
+                                ts = datetime.fromtimestamp(tr.participant_timestamp / 1e9).strftime('%H:%M:%S')
                                 
                                 new_data.append({
-                                    "Symbol": t,
-                                    "Strike": strike,
+                                    "Stock Symbol": t,
+                                    "Strike Price": f"${strike:,.2f}", # Clean Format
                                     "Expiry": expiry,
-                                    "Side": side,
-                                    "Size": trade.size,
-                                    "Value": trade_val,
-                                    "Time": trade_time,
-                                    "Tags": "🧱 HISTORICAL"
+                                    "Call or Put": side,
+                                    "Trade Size": tr.size,      # Real Size (e.g. 500)
+                                    "Trade Value": trade_val,   # Real Value (e.g. $125,000)
+                                    "Time": ts,
+                                    "Tags": "🧱 BLOCK"
                                 })
-                    except:
-                        continue
-                        
+                    except: continue
+                    
             except Exception as e:
                 continue
         
-        # Sort by Time Descending (Newest first)
-        new_data.sort(key=lambda x: x["Time"], reverse=True)
+        # Sort by Value (Biggest Whales on Top)
+        new_data.sort(key=lambda x: x["Trade Value"], reverse=True)
         
-        status.update(label=f"Done! Extracted {len(new_data)} individual trades.", state="complete", expanded=False)
-        
-        # Clear old and add new
+        status.update(label=f"Scan Complete! Found {len(new_data)} individual trades.", state="complete", expanded=False)
         st.session_state["scanner_data"].clear()
-        for row in new_data: 
-            st.session_state["scanner_data"].append(row)
+        for row in new_data: st.session_state["scanner_data"].append(row)
 
     # --- 2. WEBSOCKET ---
     def start_listener(key, tickers, threshold):
@@ -226,12 +240,12 @@ def render_scanner():
                             tag = "🧹 SWEEP" if 14 in conds else "⚡ LIVE"
                             
                             st.session_state["scanner_data"].appendleft({
-                                "Symbol": found,
-                                "Strike": strike,
+                                "Stock Symbol": found,
+                                "Strike Price": f"${strike:,.2f}",
                                 "Expiry": expiry,
-                                "Side": side,
-                                "Size": m.size,
-                                "Value": val,
+                                "Call or Put": side,
+                                "Trade Size": m.size,
+                                "Trade Value": val,
                                 "Time": time.strftime("%H:%M:%S"),
                                 "Tags": tag
                             })
@@ -243,13 +257,13 @@ def render_scanner():
     # --- 3. CONTROLS ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ"], default=["NVDA", "TSLA"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
     with col2:
         min_val = st.number_input("Min Trade Value ($)", value=20_000, step=10_000)
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
-            run_deep_backfill(api_key, watch, min_val)
+            run_deep_scan(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -260,27 +274,26 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Sort: Live/Newest trades at top
-        # Note: Time string sort works roughly for same-day
-        df = df.sort_values(by="Time", ascending=False)
+        # Sort by Value Descending
+        df = df.sort_values(by="Trade Value", ascending=False)
         
         def style_rows(row):
-            c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
+            c = '#d4f7d4' if row['Call or Put'] == 'Call' else '#f7d4d4'
             if "SWEEP" in row['Tags']: return [f'background-color: {c}; font-weight: bold; border-left: 4px solid #gold'] * len(row)
             return [f'background-color: {c}; color: black'] * len(row)
             
         st.dataframe(
-            df.style.apply(style_rows, axis=1).format({"Value": "${:,.0f}"}),
+            df.style.apply(style_rows, axis=1).format({"Trade Value": "${:,.0f}"}),
             use_container_width=True,
             height=800,
             column_config={
-                "Value": st.column_config.ProgressColumn("Trade Value", format="$%.0f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
-                "Size": st.column_config.NumberColumn("Trade Size", format="%d"),
+                "Trade Value": st.column_config.ProgressColumn("Dollar Amount", format="$%.0f", min_value=0, max_value=max(df["Trade Value"].max(), 100_000)),
+                "Trade Size": st.column_config.NumberColumn("Contract Vol", format="%d"),
             },
             hide_index=True
         )
     else:
-        st.info("Click 'Start / Refresh' to perform Deep Scan.")
+        st.info("Click 'Start / Refresh' to hunt for whales.")
 
 # ==========================================
 # ROUTER
