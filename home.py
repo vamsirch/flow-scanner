@@ -234,4 +234,65 @@ def render_scanner():
                             conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
                             tag = "🧹 SWEEP" if 14 in conds else "⚡ LIVE"
                             
-                            st.session_state
+                            st.session_state["scanner_data"].appendleft({
+                                "Symbol": found,
+                                "Strike": strike,
+                                "Expiry": expiry,
+                                "Side": side,
+                                "Trade Size": m.size,
+                                "Trade Value": val,
+                                "Time": time.strftime("%H:%M:%S"),
+                                "Tags": tag
+                            })
+                    except: continue
+
+        ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
+        ws.run(handle_msg)
+
+    # --- 3. CONTROLS ---
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
+    with col2:
+        min_val = st.number_input("Min Trade Value ($)", value=20_000, step=10_000)
+    with col3:
+        st.write("") 
+        if st.button("🔄 Start / Refresh"):
+            run_deep_miner(api_key, watch, min_val)
+            if "thread_started" not in st.session_state:
+                st.session_state["thread_started"] = True
+                t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
+                t.start()
+
+    # --- 4. DISPLAY ---
+    data = list(st.session_state["scanner_data"])
+    if len(data) > 0:
+        df = pd.DataFrame(data)
+        
+        # Sort by Value
+        df = df.sort_values(by="Trade Value", ascending=False)
+        
+        def style_rows(row):
+            c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
+            if "SWEEP" in row['Tags']: return [f'background-color: {c}; font-weight: bold; border-left: 4px solid #gold'] * len(row)
+            return [f'background-color: {c}; color: black'] * len(row)
+            
+        st.dataframe(
+            df.style.apply(style_rows, axis=1).format({"Trade Value": "${:,.0f}"}),
+            use_container_width=True,
+            height=800,
+            column_config={
+                "Trade Value": st.column_config.ProgressColumn("Dollar Amount", format="$%.0f", min_value=0, max_value=max(df["Trade Value"].max(), 100_000)),
+                "Trade Size": st.column_config.NumberColumn("Size", format="%d"),
+            },
+            hide_index=True
+        )
+    else:
+        st.info("Click 'Start / Refresh' to mine trades.")
+
+# ==========================================
+# ROUTER
+# ==========================================
+if page == "🏠 Home": render_home()
+elif page == "🔍 Contract Inspector": render_inspector()
+elif page == "⚡ Live Whale Scanner": render_scanner()
