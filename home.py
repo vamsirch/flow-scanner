@@ -12,14 +12,9 @@ from collections import deque
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
-# --- CLEAR OLD DATA (Fixes KeyError) ---
-if "init_done" not in st.session_state:
-    st.session_state.clear()
-    st.session_state["init_done"] = True
-
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
-    st.session_state["scanner_data"] = deque(maxlen=2000)
+    st.session_state["scanner_data"] = deque(maxlen=5000) # Increased buffer
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
@@ -154,45 +149,67 @@ def render_scanner():
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. BACKFILL (SNAPSHOT / DAY SUMMARY) ---
-    def run_backfill(key, tickers, threshold):
+    # --- 1. DEEP TRADE MINER (Iterates Trades, Not Snapshots) ---
+    def run_deep_miner(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Downloading Day Summary...", expanded=True)
+        status = st.status("⏳ Mining individual trade tickets...", expanded=True)
         
         for t in tickers:
             try:
-                status.write(f"📥 Analyzing {t}...")
-                chain = client.list_snapshot_options_chain(t, params={"limit": 250})
+                status.write(f"⛏️ Digging into {t}...")
                 
-                ticker_contracts = []
+                # 1. Find HOT Contracts (Snapshot)
+                # We limit to Top 20 contracts to keep API calls reasonable
+                chain = client.list_snapshot_options_chain(t, params={"limit": 20, "sort": "day_volume", "order": "desc"})
+                hot_contracts = []
                 for c in chain:
-                    # Calculate Day Volume * Close Price
-                    if c.day and c.day.volume and c.day.close:
-                        total_flow = c.day.close * c.day.volume * 100
+                    # Only look at contracts with enough volume to hide a whale
+                    if c.day and (c.day.volume * c.day.close * 100 > threshold):
+                        hot_contracts.append(c.details.ticker)
+                
+                # 2. Extract Individual Trades for each Hot Contract
+                for contract_sym in hot_contracts:
+                    try:
+                        # Fetch last 50 trades for this contract
+                        trades = client.list_trades(contract_sym, limit=50)
                         
-                        if total_flow >= threshold:
-                            side = "Call" if c.details.contract_type == "call" else "Put"
-                            strike_fmt = f"${c.details.strike_price:,.2f}"
+                        _, expiry, strike, side = parse_details(contract_sym)
+                        
+                        for tr in trades:
+                            # Calculate individual trade value
+                            val = tr.price * tr.size * 100
                             
-                            ticker_contracts.append({
-                                "Symbol": t,
-                                "Strike": strike_fmt, 
-                                "Expiry": c.details.expiration_date,
-                                "Side": side,
-                                "Volume": c.day.volume,  # TOTAL Day Volume
-                                "Value": total_flow,     # TOTAL Day Value
-                                "Time": "Day Sum",
-                                "Tags": "📊 SUMMARY"
-                            })
-                
-                # Sort and keep top 10 per stock
-                ticker_contracts.sort(key=lambda x: x["Value"], reverse=True)
-                new_data.extend(ticker_contracts[:10]) 
-                
+                            if val >= threshold:
+                                # Clean Time
+                                ts = datetime.fromtimestamp(tr.participant_timestamp / 1e9).strftime('%H:%M:%S')
+                                
+                                # Tag Logic
+                                tag = "🧱 BLOCK"
+                                # Basic logic: if size > 1000 it's likely a block
+                                if tr.size > 1000: tag = "🐋 WHALE"
+                                
+                                new_data.append({
+                                    "Symbol": t,
+                                    "Strike": strike,
+                                    "Expiry": expiry,
+                                    "Side": side,
+                                    "Size": tr.size,      # Real Trade Size (e.g. 500)
+                                    "Value": val,         # Real Trade Value (e.g. $150k)
+                                    "Time": ts,           # Exact Time
+                                    "Tags": tag
+                                })
+                    except: continue
+                    
             except: continue
         
-        status.update(label=f"Done! Loaded {len(new_data)} contracts.", state="complete", expanded=False)
+        # Sort by Time Descending (Newest First)
+        new_data.sort(key=lambda x: x["Time"], reverse=True)
+        
+        status.update(label=f"Mining Complete! Found {len(new_data)} specific trades.", state="complete", expanded=False)
+        
+        # Overwrite state with granular data
+        st.session_state["scanner_data"].clear()
         for row in new_data: st.session_state["scanner_data"].append(row)
 
     # --- 2. WEBSOCKET (REAL TRADES) ---
@@ -211,6 +228,8 @@ def render_scanner():
                         if val >= threshold:
                             _, expiry, strike, side = parse_details(m.symbol)
                             conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
+                            
+                            # Detect Sweep
                             tag = "🧹 SWEEP" if 14 in conds else "⚡ LIVE"
                             
                             st.session_state["scanner_data"].appendleft({
@@ -218,7 +237,7 @@ def render_scanner():
                                 "Strike": strike,
                                 "Expiry": expiry,
                                 "Side": side,
-                                "Volume": m.size,
+                                "Size": m.size,
                                 "Value": val,
                                 "Time": time.strftime("%H:%M:%S"),
                                 "Tags": tag
@@ -231,14 +250,13 @@ def render_scanner():
     # --- 3. CONTROLS ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
     with col2:
-        min_val = st.number_input("Min $ Amount", value=20_000, step=10_000)
+        min_val = st.number_input("Min Trade Value ($)", value=20_000, step=10_000)
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
-            st.session_state["scanner_data"].clear()
-            run_backfill(api_key, watch, min_val)
+            run_deep_miner(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -249,11 +267,9 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Sort by Dollar Amount to keep whales at top
-        df = df.sort_values(by="Value", ascending=False)
-        
         def style_rows(row):
             c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
+            if "SWEEP" in row['Tags']: return [f'background-color: {c}; font-weight: bold; border-left: 4px solid #gold'] * len(row)
             return [f'background-color: {c}; color: black'] * len(row)
             
         st.dataframe(
@@ -261,13 +277,13 @@ def render_scanner():
             use_container_width=True,
             height=800,
             column_config={
-                "Value": st.column_config.ProgressColumn("Dollar Amount", format="$%.0f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
-                "Volume": st.column_config.NumberColumn("Volume", format="%d"),
+                "Value": st.column_config.ProgressColumn("Trade Value", format="$%.0f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
+                "Size": st.column_config.NumberColumn("Trade Size", format="%d"),
             },
             hide_index=True
         )
     else:
-        st.info("Click 'Start / Refresh' to scan.")
+        st.info("Click 'Start / Refresh' to mine trades.")
 
 # ==========================================
 # ROUTER
