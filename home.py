@@ -14,12 +14,13 @@ st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
-    st.session_state["scanner_data"] = deque(maxlen=10000) # Increased buffer for "Everything"
+    st.session_state["scanner_data"] = deque(maxlen=10000) # Holds 10k rows
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
 # --- HELPER: PARSE SYMBOL ---
 def parse_details(symbol):
+    """Extracts clean details from O:NVDA251205C00185000"""
     try:
         match = re.match(r"O:([A-Z]+)(\d{6})([CP])(\d{8})", symbol)
         if match:
@@ -48,15 +49,16 @@ def render_home():
     st.info("Select a tool from the sidebar to begin.")
 
 # ==========================================
-# PAGE 2: INSPECTOR (unchanged)
+# PAGE 2: INSPECTOR (Same as before)
 # ==========================================
 def render_inspector():
     st.title("🔍 Contract Inspector")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
+
     client = RESTClient(api_key)
-    
     c1, c2 = st.columns([1, 3])
+    
     with c1:
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
@@ -74,15 +76,15 @@ def render_inspector():
             contracts = client.list_options_contracts(target, expiry.strftime("%Y-%m-%d"), "call" if side=="Call" else "put", limit=1000)
             strikes = sorted(list(set([c.strike_price for c in contracts])))
             if strikes:
-                def_ix = min(range(len(strikes)), key=lambda i: abs(strikes[i]-price)) if price > 0 else 0 # Fix: Ensure price is defined or handle error
+                def_ix = min(range(len(strikes)), key=lambda i: abs(strikes[i]-price)) if price > 0 else 0
                 sel_strike = st.selectbox("Strike", strikes, index=def_ix)
                 d = expiry.strftime("%y%m%d")
                 t = "C" if side == "Call" else "P"
                 s = f"{int(sel_strike*1000):08d}"
                 final_sym = f"O:{target}{d}{t}{s}"
-                if st.button("Analyze"): st.session_state['active_sym'] = final_sym
-            else: st.error("No strikes.")
-        except: st.error("Error fetching strikes.")
+                if st.button("Analyze", type="primary"): st.session_state['active_sym'] = final_sym
+            else: st.error("No strikes found.")
+        except: st.error("API Error")
 
     with c2:
         if 'active_sym' in st.session_state:
@@ -108,68 +110,77 @@ def render_inspector():
                             df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
                             st.area_chart(df.set_index('Time')['close'], color="#00FF00")
                         else: st.info("No trades today.")
-                    except: st.info("Chart unavailable.")
+                    except: pass
             except: st.error("Data Load Error")
 
 # ==========================================
-# PAGE 3: DEEP DRAGNET SCANNER
+# PAGE 3: DEEP WHALE SCANNER (The Fix)
 # ==========================================
 def render_scanner():
     st.title("⚡ Live Whale Stream")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. DRAGNET FUNCTION (Scans Everything) ---
-    def run_dragnet(key, tickers, threshold):
+    # --- 1. DEEP HISTORICAL SCAN (Iterates ALL Trades) ---
+    def run_deep_scan(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("🚀 Initializing Deep Dragnet...", expanded=True)
+        status = st.status("🚀 Initializing Deep Trade Mining...", expanded=True)
         
+        # Clear old data to avoid confusion
+        st.session_state["scanner_data"].clear()
+
         for t in tickers:
-            status.write(f"📂 Opening Option Chain for **{t}**...")
-            
             try:
-                # 1. GET ALL CONTRACTS (No Limit - Uses Pagination)
-                # This pulls potentially thousands of contracts
-                chain = client.list_snapshot_options_chain(t)
+                status.write(f"📂 Fetching active contracts for **{t}**...")
                 
-                potential_whales = []
+                # 1. Get Summary of ALL contracts for this ticker (Snapshot)
+                # We use this to filter OUT the garbage contracts with 0 volume
+                chain = client.list_snapshot_options_chain(t, params={"limit": 1000}) # Get huge list
                 
-                # 2. FAST FILTER (Math Check)
-                # We loop through ALL contracts but only keep the ones
-                # where Total Day Value > Threshold.
+                # 2. MATH FILTER: Only drill down if Total Day Value > Threshold
+                # This saves API calls and time.
+                candidates = []
                 for c in chain:
                     if c.day and c.day.volume and c.day.close:
-                        total_val = c.day.close * c.day.volume * 100
-                        if total_val >= threshold:
-                            potential_whales.append(c.details.ticker)
-
-                status.write(f"🔎 Found {len(potential_whales)} active contracts for {t}. Drilling down...")
+                        day_value = c.day.close * c.day.volume * 100
+                        if day_value >= threshold:
+                            candidates.append(c.details.ticker)
                 
-                # 3. DEEP DIVE (Fetch Trades for Survivors)
-                # Now we pull the trade tape for the specific contracts that passed the math check
-                for sym in potential_whales:
+                status.write(f"🔎 Found {len(candidates)} active contracts for {t}. Downloading trade tapes...")
+                
+                # 3. DOWNLOAD TRADES for each candidate
+                # We verify every single trade to see if IT matched the criteria
+                progress = status.progress(0)
+                for i, contract_sym in enumerate(candidates):
+                    progress.progress((i+1)/len(candidates))
+                    
                     try:
-                        trades = client.list_trades(sym, limit=50) # Get last 50 trades per contract
-                        _, expiry, strike, side = parse_details(sym)
+                        # Get up to 100 recent trades for this specific contract
+                        trades = client.list_trades(contract_sym, limit=100)
+                        
+                        # Parse details once
+                        _, expiry, strike, side = parse_details(contract_sym)
                         
                         for tr in trades:
-                            val = tr.price * tr.size * 100
+                            # VALUE CHECK: Is THIS specific trade big enough?
+                            trade_val = tr.price * tr.size * 100
                             
-                            if val >= threshold:
+                            if trade_val >= threshold:
                                 ts = datetime.fromtimestamp(tr.participant_timestamp / 1e9).strftime('%H:%M:%S')
                                 
                                 # Tagging
                                 tag = "🧱 BLOCK"
                                 if tr.size > 500: tag = "🐋 WHALE"
+                                elif tr.size < 5: tag = "⚠️ TINY"
                                 
                                 new_data.append({
                                     "Symbol": t,
                                     "Strike": strike,
                                     "Expiry": expiry,
                                     "Side": side,
-                                    "Trade Size": tr.size,
-                                    "Trade Value": val,
+                                    "Trade Size": tr.size,    # Exact size of this trade
+                                    "Trade Value": trade_val, # Exact value of this trade
                                     "Time": ts,
                                     "Tags": tag
                                 })
@@ -182,12 +193,11 @@ def render_scanner():
         # Sort by Time (Newest Trades First)
         new_data.sort(key=lambda x: x["Time"], reverse=True)
         
-        status.update(label=f"Dragnet Complete! Captured {len(new_data)} trades.", state="complete", expanded=False)
+        status.update(label=f"Mining Complete! Found {len(new_data)} confirmed trades.", state="complete", expanded=False)
         
-        st.session_state["scanner_data"].clear()
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET ---
+    # --- 2. WEBSOCKET (Live New Trades) ---
     def start_listener(key, tickers, threshold):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
@@ -223,13 +233,13 @@ def render_scanner():
     # --- 3. CONTROLS ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
     with col2:
-        min_val = st.number_input("Min Trade Value ($)", value=50_000, step=10_000)
+        min_val = st.number_input("Min Trade Value ($)", value=50_000, step=10_000, help="Only show trades worth more than this.")
     with col3:
         st.write("") 
-        if st.button("🚀 Run Dragnet"):
-            run_dragnet(api_key, watch, min_val)
+        if st.button("🚀 Run Deep Scan"):
+            run_deep_scan(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -240,8 +250,9 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Sort by Time (Newest First) to match Bullflow
-        df = df.sort_values(by="Time", ascending=False)
+        # Sort: Users usually want sorting by VALUE or TIME
+        # Let's sort by Value Descending to highlight Whales
+        df = df.sort_values(by="Trade Value", ascending=False)
         
         def style_rows(row):
             c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
@@ -259,7 +270,7 @@ def render_scanner():
             hide_index=True
         )
     else:
-        st.info("Click 'Run Dragnet' to scan ALL contracts for trades.")
+        st.info("Click 'Run Deep Scan' to mine today's trades.")
 
 # ==========================================
 # ROUTER
