@@ -5,6 +5,7 @@ from polygon.websocket.models import WebSocketMessage
 import threading
 import time
 import asyncio
+import re
 from datetime import datetime, timedelta
 from collections import deque
 
@@ -14,16 +15,36 @@ st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
     st.session_state["scanner_data"] = deque(maxlen=2000)
-if "ws_status" not in st.session_state:
-    st.session_state["ws_status"] = "🔴 Disconnected"
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
+
+# --- HELPER: PARSE OPTION SYMBOL ---
+def parse_symbol(symbol):
+    """
+    Extracts details from OCC Symbol: O:NVDA251205C00185000
+    Returns: (Ticker, Expiry, Strike, Side)
+    """
+    try:
+        # Regex to split: O: + Ticker + 6-digit Date + C/P + 8-digit Price
+        match = re.match(r"O:([A-Z]+)(\d{6})([CP])(\d{8})", symbol)
+        if match:
+            ticker, date_str, type_char, strike_str = match.groups()
+            
+            # Format Date: 251205 -> 2025-12-05
+            expiry = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
+            
+            # Format Strike: 00185000 -> 185.0
+            strike = float(strike_str) / 1000.0
+            
+            side = "Call" if type_char == 'C' else "Put"
+            return ticker, expiry, strike, side
+    except:
+        pass
+    return None, None, None, None
 
 # --- SIDEBAR NAVIGATION ---
 with st.sidebar:
     st.title("🐋 FlowTrend AI")
-    st.caption(f"Status: {st.session_state['ws_status']}")
-    
     page = st.radio("Navigate", ["🏠 Home", "🔍 Contract Inspector", "⚡ Live Whale Scanner"])
     st.divider()
     
@@ -56,9 +77,10 @@ def render_inspector():
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
-        # --- SILENT PRICE CHECK ---
+        # --- FIXED: SILENT PRICE FALLBACK ---
         price = 0
         try:
+            # Try Real-Time
             snap = client.get_snapshot_ticker("stocks", target)
             if snap and snap.last_trade:
                 price = snap.last_trade.price
@@ -67,6 +89,7 @@ def render_inspector():
                 price = snap.day.close
                 st.info(f"📍 {target}: ${price:.2f} (Close)")
         except:
+            # Fallback to Previous Close without error popup
             try:
                 prev = client.get_previous_close_agg(target)
                 if prev:
@@ -80,7 +103,7 @@ def render_inspector():
         
         st.write("---")
         
-        # --- STRIKE FETCH ---
+        # Strike Fetcher
         try:
             contracts = client.list_options_contracts(
                 underlying_ticker=target,
@@ -114,7 +137,6 @@ def render_inspector():
                 snap = client.get_snapshot_option(target, sym)
                 if snap:
                     m1, m2, m3, m4 = st.columns(4)
-                    # Handle missing trade data safely
                     p = snap.last_trade.price if snap.last_trade else (snap.day.close if snap.day else 0)
                     v = snap.day.volume if snap.day else 0
                     
@@ -126,23 +148,18 @@ def render_inspector():
                     st.write("### ⚡ Price Chart")
                     today = datetime.now().strftime("%Y-%m-%d")
                     
-                    # Chart Logic
                     chart_data = None
                     try:
                         aggs = client.get_aggs(sym, 5, "minute", today, today)
-                        if aggs:
-                            chart_data = aggs
-                    except:
-                        pass
+                        if aggs: chart_data = aggs
+                    except: pass 
 
                     if not chart_data:
                         try:
                             start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
                             aggs = client.get_aggs(sym, 1, "day", start, today)
-                            if aggs:
-                                chart_data = aggs
-                        except:
-                            pass
+                            if aggs: chart_data = aggs
+                        except: pass
 
                     if chart_data:
                         df = pd.DataFrame(chart_data)
@@ -164,35 +181,38 @@ def render_scanner():
         st.error("Please enter API Key in the sidebar.")
         return
 
-    # --- 1. BACKFILL (Historical Data) ---
+    # --- 1. BACKFILL (Historical Day Summary) ---
     def run_backfill(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Loading Day's Summary...", expanded=True)
+        status = st.status("⏳ Loading Day's Most Active Contracts...", expanded=True)
         
         for t in tickers:
             try:
-                status.write(f"📥 Fetching Top Volume for {t}...")
+                status.write(f"Checking {t}...")
                 chain = client.list_snapshot_options_chain(t, params={"limit": 250})
                 
                 ticker_contracts = []
                 for c in chain:
                     if c.day and c.day.volume and c.day.close:
                         flow = c.day.close * c.day.volume * 100
+                        
                         if flow >= threshold:
                             side = "Call" if c.details.contract_type == "call" else "Put"
                             ticker_contracts.append({
-                                "Stock Symbol": t,
-                                "Strike Price": f"${c.details.strike_price}",
-                                "Call or Put": side,
-                                "Contract Volume": c.day.volume,
-                                "Dollar Amount": flow,
-                                "Tags": "📊 HISTORICAL"
+                                "Symbol": t,
+                                "Strike": f"${c.details.strike_price:.1f}",
+                                "Expiry": c.details.expiration_date,
+                                "Side": side,
+                                "Size": c.day.volume, # It is Day Volume here
+                                "Premium": flow,
+                                "Time": "Day Sum",
+                                "Tags": "📊 DAY VOL"
                             })
                 
-                # Sort manually by Dollar Amount
-                ticker_contracts.sort(key=lambda x: x["Dollar Amount"], reverse=True)
-                new_data.extend(ticker_contracts[:20]) 
+                # Sort manually
+                ticker_contracts.sort(key=lambda x: x["Premium"], reverse=True)
+                new_data.extend(ticker_contracts[:15]) 
                 
             except Exception as e:
                 continue
@@ -201,64 +221,60 @@ def render_scanner():
         for row in new_data:
             st.session_state["scanner_data"].append(row)
 
-    # --- 2. LIVE WEBSOCKET LISTENER ---
+    # --- 2. WEBSOCKET (Real-Time Individual Trades) ---
     def start_listener(key, tickers, threshold):
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
 
         def handle_msg(msgs: list[WebSocketMessage]):
-            st.session_state["ws_status"] = "🟢 Connected" # Update status
-            
             for m in msgs:
                 if m.event_type == "T":
                     try:
+                        # 1. Check Watchlist
                         found = next((t for t in tickers if t in m.symbol), None)
                         if not found: continue
 
+                        # 2. Filter Value
                         flow = m.price * m.size * 100
-                        if flow >= threshold:
-                            side = "Call" if "C" in m.symbol else "Put"
-                            
-                            conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
-                            tag = "🧹 SWEEP" if 14 in conds else "⚡ LIVE"
-                            
-                            st.session_state["scanner_data"].appendleft({
-                                "Stock Symbol": found,
-                                "Strike Price": "Live Print", 
-                                "Call or Put": side,
-                                "Contract Volume": m.size,
-                                "Dollar Amount": flow,
-                                "Tags": tag
-                            })
+                        if flow < threshold: continue
+
+                        # 3. Parse Symbol for details
+                        # Ticker, Expiry, Strike, Side = parse_symbol(m.symbol)
+                        _, expiry, strike, side = parse_symbol(m.symbol)
+                        
+                        # 4. Tags
+                        conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
+                        tag = "🧹 SWEEP" if 14 in conds else "⚡ TRADE"
+                        
+                        st.session_state["scanner_data"].appendleft({
+                            "Symbol": found,
+                            "Strike": f"${strike}", 
+                            "Expiry": expiry,
+                            "Side": side,
+                            "Size": m.size, # This is Trade Size
+                            "Premium": flow,
+                            "Time": time.strftime("%H:%M:%S"),
+                            "Tags": tag
+                        })
                     except: continue
 
-        # AUTO-RECONNECT LOOP
-        while True:
-            try:
-                st.session_state["ws_status"] = "🟡 Connecting..."
-                ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
-                ws.run(handle_msg)
-            except Exception as e:
-                st.session_state["ws_status"] = "🔴 Error (Retrying...)"
-                time.sleep(2) # Wait before retry
+        ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
+        ws.run(handle_msg)
 
     # --- 3. CONTROLS ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
     with col2:
-        min_val = st.number_input("Min $ Amount", value=10_000, step=5_000)
+        min_val = st.number_input("Min Premium ($)", value=20_000, step=10_000)
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
             st.session_state["scanner_data"].clear()
-            
-            # Run Backfill
             run_backfill(api_key, watch, min_val)
             
-            # Start Live Thread (if not already running)
-            # Note: We use a simple check to avoid duplicate threads
+            # Start Thread if not running
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -270,26 +286,24 @@ def render_scanner():
         df = pd.DataFrame(data)
         
         def style_rows(row):
-            c = '#d4f7d4' if row['Call or Put'] == 'Call' else '#f7d4d4'
+            c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
+            # Highlight Sweeps brighter
+            if "SWEEP" in row['Tags']:
+                return [f'background-color: {c}; font-weight: bold; border-left: 4px solid #gold'] * len(row)
             return [f'background-color: {c}; color: black'] * len(row)
             
         st.dataframe(
-            df.style.apply(style_rows, axis=1).format({"Dollar Amount": "${:,.0f}"}),
+            df.style.apply(style_rows, axis=1).format({"Premium": "${:,.0f}"}),
             use_container_width=True,
             height=800,
             column_config={
-                "Dollar Amount": st.column_config.ProgressColumn("Value", format="$%f", min_value=0, max_value=max(df["Dollar Amount"].max(), 100_000)),
-                "Contract Volume": st.column_config.NumberColumn("Volume", format="%d"),
+                "Premium": st.column_config.ProgressColumn("Dollar Amount", format="$%f", min_value=0, max_value=max(df["Premium"].max(), 100_000)),
+                "Size": st.column_config.NumberColumn("Vol / Size", format="%d"),
             },
             hide_index=True
         )
-        
-        # Auto-refresh UI every 2 seconds to show new rows
-        time.sleep(2)
-        st.rerun()
-        
     else:
-        st.info("Click 'Start / Refresh' to scan for whales.")
+        st.info("Click 'Start / Refresh' to scan.")
 
 # ==========================================
 # MAIN ROUTER
