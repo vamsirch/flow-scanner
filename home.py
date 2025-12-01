@@ -21,7 +21,6 @@ if "api_key" not in st.session_state:
 # --- HELPER: PARSE SYMBOL ---
 def parse_details(symbol):
     try:
-        # Regex: O:Ticker + Date + Type + Price
         match = re.match(r"O:([A-Z]+)(\d{6})([CP])(\d{8})", symbol)
         if match:
             ticker, date_str, type_char, strike_str = match.groups()
@@ -64,7 +63,6 @@ def render_inspector():
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
-        # Silent Price Check
         price = 0
         try:
             snap = client.get_snapshot_ticker("stocks", target)
@@ -150,48 +148,64 @@ def render_scanner():
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. BACKFILL (FIXED: USES LAST TRADE, NOT DAY SUM) ---
-    def run_backfill(key, tickers, threshold):
+    # --- 1. DEEP BACKFILL (Fetches INDIVIDUAL TRADES) ---
+    def run_deep_backfill(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Downloading recent large trades...", expanded=True)
+        status = st.status("⏳ Deep Scanning: Fetching Individual Trades...", expanded=True)
         
         for t in tickers:
             try:
-                status.write(f"📥 Analyzing {t}...")
-                chain = client.list_snapshot_options_chain(t, params={"limit": 250})
+                status.write(f"🔎 Scanning {t}...")
                 
-                ticker_contracts = []
+                # Step 1: Get Top 10 Most Active Contracts (Snapshot)
+                # We can't query trades for ALL contracts, so we pick the hottest ones
+                chain = client.list_snapshot_options_chain(t, params={"limit": 50})
+                active_contracts = []
                 for c in chain:
-                    # KEY FIX: Use 'last_trade' (Single print) not 'day' (Aggregate)
-                    if c.last_trade and c.last_trade.price and c.last_trade.size:
-                        
-                        # Calculate value of just the LAST trade
-                        trade_val = c.last_trade.price * c.last_trade.size * 100
-                        
-                        if trade_val >= threshold:
-                            side = "Call" if c.details.contract_type == "call" else "Put"
-                            strike_fmt = f"${c.details.strike_price:,.2f}"
-                            
-                            ticker_contracts.append({
-                                "Symbol": t,
-                                "Strike": strike_fmt, 
-                                "Expiry": c.details.expiration_date,
-                                "Side": side,
-                                "Size": c.last_trade.size,  # Real Trade Size
-                                "Value": trade_val,         # Real Trade Value
-                                "Time": "Last Prt",         # Last Print
-                                "Tags": "🧱 BLOCK"
-                            })
+                    if c.day and c.day.volume:
+                        active_contracts.append(c.details.ticker)
                 
-                # Sort manually
-                ticker_contracts.sort(key=lambda x: x["Value"], reverse=True)
-                new_data.extend(ticker_contracts[:10]) 
-                
-            except: continue
+                # Step 2: For each active contract, fetch REAL individual trades
+                # Limit to top 5 contracts to save time/API calls
+                for contract_sym in active_contracts[:5]:
+                    try:
+                        # Fetch last 10 trades for this specific contract
+                        trades = client.list_trades(contract_sym, limit=10)
+                        
+                        _, expiry, strike, side = parse_details(contract_sym)
+                        
+                        for trade in trades:
+                            trade_val = trade.price * trade.size * 100
+                            if trade_val >= threshold:
+                                # Convert TS to readable time
+                                trade_time = datetime.fromtimestamp(trade.participant_timestamp / 1e9).strftime('%H:%M:%S')
+                                
+                                new_data.append({
+                                    "Symbol": t,
+                                    "Strike": strike,
+                                    "Expiry": expiry,
+                                    "Side": side,
+                                    "Size": trade.size,
+                                    "Value": trade_val,
+                                    "Time": trade_time,
+                                    "Tags": "🧱 HISTORICAL"
+                                })
+                    except:
+                        continue
+                        
+            except Exception as e:
+                continue
         
-        status.update(label=f"Done! Loaded {len(new_data)} whales.", state="complete", expanded=False)
-        for row in new_data: st.session_state["scanner_data"].append(row)
+        # Sort by Time Descending (Newest first)
+        new_data.sort(key=lambda x: x["Time"], reverse=True)
+        
+        status.update(label=f"Done! Extracted {len(new_data)} individual trades.", state="complete", expanded=False)
+        
+        # Clear old and add new
+        st.session_state["scanner_data"].clear()
+        for row in new_data: 
+            st.session_state["scanner_data"].append(row)
 
     # --- 2. WEBSOCKET ---
     def start_listener(key, tickers, threshold):
@@ -229,14 +243,13 @@ def render_scanner():
     # --- 3. CONTROLS ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ"], default=["NVDA", "TSLA"])
     with col2:
         min_val = st.number_input("Min Trade Value ($)", value=20_000, step=10_000)
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
-            st.session_state["scanner_data"].clear()
-            run_backfill(api_key, watch, min_val)
+            run_deep_backfill(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -247,8 +260,9 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # CRITICAL: Sort by Trade Value (Descending)
-        df = df.sort_values(by="Value", ascending=False)
+        # Sort: Live/Newest trades at top
+        # Note: Time string sort works roughly for same-day
+        df = df.sort_values(by="Time", ascending=False)
         
         def style_rows(row):
             c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
@@ -266,7 +280,7 @@ def render_scanner():
             hide_index=True
         )
     else:
-        st.info("Click 'Start / Refresh' to scan.")
+        st.info("Click 'Start / Refresh' to perform Deep Scan.")
 
 # ==========================================
 # ROUTER
