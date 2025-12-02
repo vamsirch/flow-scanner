@@ -6,7 +6,7 @@ import threading
 import time
 import asyncio
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 import pytz
 
@@ -19,14 +19,12 @@ if "init_done" not in st.session_state:
     st.session_state["init_done"] = True
 
 if "scanner_data" not in st.session_state:
-    # Increased buffer to 10,000 rows to hold the "Firehose"
     st.session_state["scanner_data"] = deque(maxlen=10000)
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
 # --- HELPERS ---
 def get_est_time(nanosecs):
-    """Converts UTC nanoseconds to EST string"""
     try:
         dt = datetime.fromtimestamp(nanosecs / 1e9, tz=pytz.utc)
         return dt.astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M:%S')
@@ -53,25 +51,26 @@ with st.sidebar:
     if api_input: st.session_state["api_key"] = api_input
 
 # ==========================================
-# PAGE 1 & 2 (Home/Inspector) - Unchanged
+# PAGE 1 & 2 (Home/Inspector)
 # ==========================================
 def render_home():
     st.title("Welcome to FlowTrend Pro")
-    st.info("Select 'Live Whale Scanner' to see the feed.")
+    st.info("Select a tool from the sidebar.")
 
 def render_inspector():
     st.title("🔍 Contract Inspector")
-    st.info("Please focus on the Live Whale Scanner tab for now.")
+    # (Simplified for brevity as we focus on the Scanner fix)
+    st.info("Please focus on the Live Whale Scanner tab for the trade feed.")
 
 # ==========================================
 # PAGE 3: UNLIMITED FIREHOSE SCANNER
 # ==========================================
 def render_scanner():
-    st.title("⚡ Live Whale Stream (No Limits)")
+    st.title("⚡ Live Whale Stream")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. FIREHOSE BACKFILL ---
+    # --- 1. FIREHOSE BACKFILL (THE FIX) ---
     def run_firehose_backfill(key, tickers, min_val):
         client = RESTClient(key)
         new_data = []
@@ -82,64 +81,61 @@ def render_scanner():
 
         for t in tickers:
             try:
-                status.write(f"📥 Getting Active Contracts for {t}...")
+                status.write(f"📥 Identifying Active Contracts for {t}...")
                 
-                # 1. Get ALL Active Contracts (No limits, we pull the full chain)
-                # We iterate via pagination automatically
+                # 1. Get Snapshot (Contract List)
                 chain = client.list_snapshot_options_chain(t, params={"limit": 250})
                 
-                # Filter for contracts that actually traded today
+                # Filter for contracts that have volume
                 active_contracts = []
                 for c in chain:
-                    if c.day and c.day.volume > 0:
+                    # FIX: Check if c.day exists AND c.day.volume is not None
+                    if c.day and c.day.volume and c.day.volume > 0:
                         active_contracts.append(c.details.ticker)
                 
                 status.write(f"🔎 Scanning {len(active_contracts)} active contracts for {t}...")
                 
-                # 2. Pull Trades for ALL Active Contracts
-                # We loop through EVERY contract that had volume today.
+                # 2. Pull Individual Trades
                 for contract_sym in active_contracts:
                     try:
                         # Get recent trades
                         trades = client.list_trades(contract_sym, limit=50)
-                        
-                        # Parse symbol once
                         _, expiry, strike, side = parse_details(contract_sym)
                         
                         for tr in trades:
                             val = tr.price * tr.size * 100
                             
-                            # USER FILTER ONLY (If they want to see everything, set min_val to 0)
+                            # Filter
                             if val >= min_val:
                                 ts = get_est_time(tr.participant_timestamp)
                                 
-                                # Tag
                                 tag = "Block"
-                                if tr.size < 10: tag = "Small"
-                                elif tr.size > 1000: tag = "Whale"
+                                if tr.size > 1000: tag = "Whale"
+                                elif tr.size < 5: tag = "Small"
                                 
                                 new_data.append({
                                     "Stock Symbol": t,
                                     "Strike Price": strike,
                                     "Call or Put": side,
-                                    "Contract Volume": tr.size, # Individual Trade Size
-                                    "Dollar Amount": val,       # Individual Trade Value
+                                    "Contract Volume": tr.size, # Specific Trade Size
+                                    "Dollar Amount": val,       # Specific Trade Value
                                     "Time": ts,
                                     "Tags": tag
                                 })
                     except: continue
                     
             except Exception as e:
-                status.warning(f"Error on {t}: {e}")
+                # Log error but don't stop
+                print(f"Error on {t}: {e}")
                 continue
         
-        # Sort by Time (Newest First)
+        # Sort by Time
         new_data.sort(key=lambda x: x["Time"], reverse=True)
         
         status.update(label=f"Done! Loaded {len(new_data)} trades.", state="complete", expanded=False)
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET LISTENER (FIREHOSE) ---
+    # --- 2. WEBSOCKET LISTENER ---
     def start_listener(key, tickers, min_val):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
@@ -152,8 +148,6 @@ def render_scanner():
                         if not found: continue
 
                         val = m.price * m.size * 100
-                        
-                        # Only apply user's dollar filter
                         if val >= min_val:
                             _, _, strike, side = parse_details(m.symbol)
                             ts = get_est_time(m.participant_timestamp)
@@ -175,10 +169,9 @@ def render_scanner():
     # --- 3. CONTROLS ---
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "IWM"], default=["NVDA", "TSLA", "AAPL", "AMD"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "IWM"], default=["NVDA", "TSLA"])
     with c2:
-        # User requested filtering by value:
-        min_val = st.number_input("Filter: Min Trade Value ($)", value=1000, step=1000, help="Set to 0 to see EVERYTHING.")
+        min_val = st.number_input("Filter: Min Trade Value ($)", value=5000, step=1000)
     with c3:
         st.write("")
         if st.button("🚀 Start Firehose"):
@@ -193,9 +186,8 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # ALLOW USER TO SORT
-        # Default sort: Time (Newest First)
-        # User can click headers to sort by "Dollar Amount"
+        # User requested sorting by Trade Value
+        df = df.sort_values(by="Dollar Amount", ascending=False)
         
         st.dataframe(
             df,
