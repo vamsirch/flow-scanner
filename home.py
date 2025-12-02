@@ -12,12 +12,11 @@ from collections import deque
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
-# --- CLEAR CACHE ON STARTUP ---
+# --- INITIALIZATION ---
 if "init_done" not in st.session_state:
     st.session_state.clear()
     st.session_state["init_done"] = True
 
-# --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
     st.session_state["scanner_data"] = deque(maxlen=2000)
 if "api_key" not in st.session_state:
@@ -33,8 +32,7 @@ def parse_details(symbol):
             strike_val = float(strike_str) / 1000.0
             side = "Call" if type_char == 'C' else "Put"
             return ticker, expiry, f"${strike_val:,.2f}", side
-    except:
-        pass
+    except: pass
     return symbol, "-", "-", "-"
 
 # --- SIDEBAR ---
@@ -66,7 +64,6 @@ def render_inspector():
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
-        # Silent Price Check
         price = 0
         try:
             snap = client.get_snapshot_ticker("stocks", target)
@@ -87,25 +84,19 @@ def render_inspector():
         expiry = st.date_input("Expiration", value=datetime.now().date())
         side = st.radio("Side", ["Call", "Put"], horizontal=True)
         st.write("---")
-        
         try:
             contracts = client.list_options_contracts(target, expiry.strftime("%Y-%m-%d"), "call" if side=="Call" else "put", limit=1000)
             strikes = sorted(list(set([c.strike_price for c in contracts])))
             if strikes:
                 def_ix = min(range(len(strikes)), key=lambda i: abs(strikes[i]-price)) if price > 0 else 0
                 sel_strike = st.selectbox("Strike", strikes, index=def_ix)
-                
                 d = expiry.strftime("%y%m%d")
                 t = "C" if side == "Call" else "P"
                 s = f"{int(sel_strike*1000):08d}"
                 final_sym = f"O:{target}{d}{t}{s}"
-                
-                if st.button("Analyze", type="primary"):
-                    st.session_state['active_sym'] = final_sym
-            else:
-                st.error("No strikes found.")
-        except Exception as e:
-            st.error(f"API Error: {e}")
+                if st.button("Analyze", type="primary"): st.session_state['active_sym'] = final_sym
+            else: st.error("No strikes found.")
+        except: st.error("API Error")
 
     with c2:
         if 'active_sym' in st.session_state:
@@ -117,83 +108,74 @@ def render_inspector():
                     m1, m2, m3, m4 = st.columns(4)
                     p = snap.last_trade.price if snap.last_trade else (snap.day.close if snap.day else 0)
                     v = snap.day.volume if snap.day else 0
-                    m1.metric("Price", f"${p}", f"Vol: {v}")
+                    m1.metric("💰 Price", f"${p}", f"Vol: {v}")
                     if snap.greeks:
                         m2.metric("Delta", f"{snap.greeks.delta:.2f}")
                         m3.metric("Gamma", f"{snap.greeks.gamma:.2f}")
-                    
                     st.write("### ⚡ Price Chart")
                     today = datetime.now().strftime("%Y-%m-%d")
-                    chart_data = None
                     try:
                         aggs = client.get_aggs(sym, 5, "minute", today, today)
-                        if aggs: chart_data = aggs
-                    except: pass 
-                    if not chart_data:
-                        try:
-                            start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-                            aggs = client.get_aggs(sym, 1, "day", start, today)
-                            if aggs: chart_data = aggs
-                        except: pass
-
-                    if chart_data:
-                        df = pd.DataFrame(chart_data)
-                        df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
-                        st.area_chart(df.set_index('Time')['close'], color="#00FF00")
-                    else:
-                        st.info("No trades today.")
+                        if aggs:
+                            df = pd.DataFrame(aggs)
+                            df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
+                            st.area_chart(df.set_index('Time')['close'], color="#00FF00")
+                        else: st.info("No trades today.")
+                    except: st.info("Chart Unavailable")
             except: st.error("Data Load Error")
 
 # ==========================================
-# PAGE 3: LIVE SCANNER
+# PAGE 3: DEEP WHALE SCANNER
 # ==========================================
 def render_scanner():
     st.title("⚡ Live Whale Stream")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. CRASH-PROOF BACKFILL ---
-    def run_backfill(key, tickers, threshold):
+    # --- 1. ROBUST TRADE MINER ---
+    def run_deep_scan(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Hunting whales (Manual Sort)...", expanded=True)
+        status = st.status("⏳ Downloading contracts...", expanded=True)
         
+        # Clear old data
+        st.session_state["scanner_data"].clear() 
+
         for t in tickers:
             try:
-                status.write(f"📥 Getting contracts for {t}...")
+                status.write(f"📥 Scanning {t} (Manual Sort)...")
                 
-                # FIX: Removed "sort" param because it caused the error.
-                # We request a raw list of 250 contracts instead.
+                # FIX: REMOVED "SORT" PARAM (It crashes the API)
+                # Instead, we request 250 contracts and sort them in Python
                 chain = client.list_snapshot_options_chain(t, params={"limit": 250})
                 
-                # 1. Collect all valid contracts into a Python list
+                # 1. Manually Sort by Day Volume in Python
                 valid_contracts = []
                 for c in chain:
                     if c.day and c.day.volume:
                         valid_contracts.append(c)
                 
-                # 2. Python Sort: Find Highest Volume contracts
                 valid_contracts.sort(key=lambda x: x.day.volume, reverse=True)
                 
-                # 3. Take Top 20 active contracts to drill into
-                top_contracts = valid_contracts[:20]
+                # Take Top 15 most active contracts
+                hot_contracts = [c.details.ticker for c in valid_contracts[:15]]
                 
-                status.write(f"🔎 Drilling into Top {len(top_contracts)} active contracts...")
-                
-                for c in top_contracts:
-                    contract_sym = c.details.ticker
+                # 2. Drill Down
+                for contract_sym in hot_contracts:
                     try:
-                        # 4. Get INDIVIDUAL TRADES
-                        trades = client.list_trades(contract_sym, limit=50)
+                        trades = client.list_trades(contract_sym, limit=100) # Deeper look
                         _, expiry, strike, side = parse_details(contract_sym)
                         
                         for tr in trades:
-                            val = tr.price * tr.size * 100
+                            trade_val = tr.price * tr.size * 100
                             
-                            if val >= threshold:
-                                ts = datetime.fromtimestamp(tr.participant_timestamp / 1e9).strftime('%H:%M:%S')
+                            if trade_val >= threshold:
+                                # Convert TS
+                                dt_object = datetime.fromtimestamp(tr.participant_timestamp / 1e9)
+                                ts = dt_object.strftime('%H:%M:%S')
+                                
                                 tag = "🧱 BLOCK"
-                                if tr.size > 2000: tag = "🐋 WHALE"
+                                if tr.size > 1000: tag = "🐋 WHALE"
                                 
                                 new_data.append({
                                     "Symbol": t,
@@ -201,24 +183,21 @@ def render_scanner():
                                     "Expiry": expiry,
                                     "Side": side,
                                     "Trade Size": tr.size,      
-                                    "Trade Value": val,         
+                                    "Trade Value": trade_val,   
                                     "Time": ts,
                                     "Tags": tag
                                 })
                     except: continue
-                    
             except Exception as e:
-                # Print error to UI so we know if API fails
                 status.warning(f"Skipping {t}: {e}")
                 continue
         
-        # Final Sort by Time
         new_data.sort(key=lambda x: x["Time"], reverse=True)
         
-        status.update(label=f"Done! Found {len(new_data)} trades.", state="complete", expanded=False)
+        status.update(label=f"Scan Complete! Found {len(new_data)} individual trades.", state="complete", expanded=False)
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET LISTENER ---
+    # --- 2. WEBSOCKET ---
     def start_listener(key, tickers, threshold):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
@@ -236,6 +215,9 @@ def render_scanner():
                             conds = m.conditions if hasattr(m, 'conditions') and m.conditions else []
                             tag = "🧹 SWEEP" if 14 in conds else "⚡ LIVE"
                             
+                            dt_object = datetime.fromtimestamp(m.participant_timestamp / 1e9)
+                            ts = dt_object.strftime('%H:%M:%S')
+                            
                             st.session_state["scanner_data"].appendleft({
                                 "Symbol": found,
                                 "Strike": strike,
@@ -243,7 +225,7 @@ def render_scanner():
                                 "Side": side,
                                 "Trade Size": m.size,
                                 "Trade Value": val,
-                                "Time": time.strftime("%H:%M:%S"),
+                                "Time": ts,
                                 "Tags": tag
                             })
                     except: continue
@@ -260,8 +242,7 @@ def render_scanner():
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
-            st.session_state["scanner_data"].clear()
-            run_backfill(api_key, watch, min_val)
+            run_deep_scan(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -272,7 +253,7 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Sort by Value Descending
+        # Sort by Value
         df = df.sort_values(by="Trade Value", ascending=False)
         
         def style_rows(row):
