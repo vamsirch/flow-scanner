@@ -12,29 +12,28 @@ from collections import deque
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
-# --- 1. CRITICAL FIX: CLEAR OLD CACHE ON RELOAD ---
-# This prevents the KeyError by wiping old data formats
+# --- CLEAR CACHE ON STARTUP (Prevents Errors) ---
 if "init_done" not in st.session_state:
     st.session_state.clear()
     st.session_state["init_done"] = True
 
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
-    st.session_state["scanner_data"] = deque(maxlen=2000)
+    st.session_state["scanner_data"] = deque(maxlen=5000)
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
 # --- HELPER: PARSE SYMBOL ---
 def parse_details(symbol):
+    """Extracts clean details from O:NVDA251205C00185000"""
     try:
         match = re.match(r"O:([A-Z]+)(\d{6})([CP])(\d{8})", symbol)
         if match:
             ticker, date_str, type_char, strike_str = match.groups()
             expiry = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
             strike_val = float(strike_str) / 1000.0
-            strike_display = f"${strike_val:,.2f}"
             side = "Call" if type_char == 'C' else "Put"
-            return ticker, expiry, strike_display, side
+            return ticker, expiry, f"${strike_val:,.2f}", side
     except:
         pass
     return symbol, "-", "-", "-"
@@ -55,13 +54,12 @@ def render_home():
     st.info("Select a tool from the sidebar to begin.")
 
 # ==========================================
-# PAGE 2: CONTRACT INSPECTOR
+# PAGE 2: INSPECTOR (Unchanged)
 # ==========================================
 def render_inspector():
     st.title("🔍 Contract Inspector")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
-
     client = RESTClient(api_key)
     c1, c2 = st.columns([1, 3])
     
@@ -69,46 +67,29 @@ def render_inspector():
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
-        # Silent Price Check
-        price = 0
         try:
             snap = client.get_snapshot_ticker("stocks", target)
-            if snap and snap.last_trade:
-                price = snap.last_trade.price
-                st.success(f"📍 {target}: ${price:.2f}")
-            elif snap and snap.day:
-                price = snap.day.close
-                st.info(f"📍 {target}: ${price:.2f} (Close)")
+            price = snap.last_trade.price if snap.last_trade else snap.day.close
+            st.success(f"📍 {target}: ${price:.2f}")
         except:
-            try:
-                prev = client.get_previous_close_agg(target)
-                if prev:
-                    price = prev[0].close
-                    st.info(f"📍 {target}: ${price:.2f} (Prev)")
-            except: st.warning("Price Unavailable")
+            st.warning("Price Unavailable")
             
         expiry = st.date_input("Expiration", value=datetime.now().date())
         side = st.radio("Side", ["Call", "Put"], horizontal=True)
         st.write("---")
-        
         try:
             contracts = client.list_options_contracts(target, expiry.strftime("%Y-%m-%d"), "call" if side=="Call" else "put", limit=1000)
             strikes = sorted(list(set([c.strike_price for c in contracts])))
             if strikes:
-                def_ix = min(range(len(strikes)), key=lambda i: abs(strikes[i]-price)) if price > 0 else 0
+                def_ix = min(range(len(strikes)), key=lambda i: abs(strikes[i]-price)) if price > 0 else 0 # Fixed price usage
                 sel_strike = st.selectbox("Strike", strikes, index=def_ix)
-                
                 d = expiry.strftime("%y%m%d")
                 t = "C" if side == "Call" else "P"
                 s = f"{int(sel_strike*1000):08d}"
                 final_sym = f"O:{target}{d}{t}{s}"
-                
-                if st.button("Analyze", type="primary"):
-                    st.session_state['active_sym'] = final_sym
-            else:
-                st.error("No strikes found.")
-        except Exception as e:
-            st.error(f"API Error: {e}")
+                if st.button("Analyze", type="primary"): st.session_state['active_sym'] = final_sym
+            else: st.error("No strikes found.")
+        except: st.error("API Error")
 
     with c2:
         if 'active_sym' in st.session_state:
@@ -127,28 +108,18 @@ def render_inspector():
                     
                     st.write("### ⚡ Price Chart")
                     today = datetime.now().strftime("%Y-%m-%d")
-                    chart_data = None
                     try:
                         aggs = client.get_aggs(sym, 5, "minute", today, today)
-                        if aggs: chart_data = aggs
-                    except: pass 
-                    if not chart_data:
-                        try:
-                            start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-                            aggs = client.get_aggs(sym, 1, "day", start, today)
-                            if aggs: chart_data = aggs
-                        except: pass
-
-                    if chart_data:
-                        df = pd.DataFrame(chart_data)
-                        df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
-                        st.area_chart(df.set_index('Time')['close'], color="#00FF00")
-                    else:
-                        st.info("No trades today.")
+                        if aggs:
+                            df = pd.DataFrame(aggs)
+                            df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
+                            st.area_chart(df.set_index('Time')['close'], color="#00FF00")
+                        else: st.info("No trades today.")
+                    except: pass
             except: st.error("Data Load Error")
 
 # ==========================================
-# PAGE 3: LIVE SCANNER
+# PAGE 3: DEEP WHALE SCANNER (THE FIX)
 # ==========================================
 def render_scanner():
     st.title("⚡ Live Whale Stream")
@@ -159,25 +130,31 @@ def render_scanner():
     def run_deep_scan(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Downloading trade tape (this finds individual blocks)...", expanded=True)
+        status = st.status("⏳ Hunting individual whale trades (Deep Scan)...", expanded=True)
         
+        # We clear the old "Aggregate" data so you only see specific trades
+        st.session_state["scanner_data"].clear()
+
         for t in tickers:
             try:
-                status.write(f"📥 Scanning Top Contracts for {t}...")
+                status.write(f"🔎 Scanning active contracts for {t}...")
                 
-                # Step 1: Find Active Contracts (Snapshot)
-                # We fetch the Top 20 most active options for today
+                # 1. Find the Hot Contracts (Snapshot)
+                # We limit to Top 20 contracts to keep API calls reasonable
                 chain = client.list_snapshot_options_chain(t, params={"limit": 20, "sort": "day_volume", "order": "desc"})
                 
                 hot_contracts = []
                 for c in chain:
                     if c.day and c.day.volume:
-                        hot_contracts.append(c.details.ticker)
+                        # Only drill down if total volume implies activity
+                        if (c.day.volume * c.day.close * 100) > threshold:
+                            hot_contracts.append(c.details.ticker)
                 
-                # Step 2: Fetch INDIVIDUAL TRADES for these contracts
+                # 2. Fetch TRADE TAPE for each Hot Contract
+                # This gets the individual lines you want
                 for contract_sym in hot_contracts:
                     try:
-                        # Get last 50 trades
+                        # Get last 50 specific trades
                         trades = client.list_trades(contract_sym, limit=50)
                         
                         _, expiry, strike, side = parse_details(contract_sym)
@@ -206,16 +183,16 @@ def render_scanner():
                                 })
                     except: continue
                     
-            except: continue
+            except Exception as e:
+                continue
         
-        # Sort by Value (Whales First)
-        new_data.sort(key=lambda x: x["Trade Value"], reverse=True)
+        # Sort by Time Descending (Newest Trades First)
+        new_data.sort(key=lambda x: x["Time"], reverse=True)
         
-        status.update(label=f"Done! Extracted {len(new_data)} individual trades.", state="complete", expanded=False)
-        st.session_state["scanner_data"].clear()
+        status.update(label=f"Scan Complete! Found {len(new_data)} specific trades.", state="complete", expanded=False)
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET LISTENER ---
+    # --- 2. WEBSOCKET ---
     def start_listener(key, tickers, threshold):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
