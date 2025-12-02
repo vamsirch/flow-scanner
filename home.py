@@ -10,11 +10,11 @@ from datetime import datetime, timedelta
 from collections import deque
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="FlowTrend Pro", layout="wide")
+st.set_page_config(page_title="FlowTrend Pro (Debug)", layout="wide")
 
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
-    st.session_state["scanner_data"] = deque(maxlen=5000)
+    st.session_state["scanner_data"] = deque(maxlen=2000)
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
@@ -26,9 +26,8 @@ def parse_details(symbol):
             ticker, date_str, type_char, strike_str = match.groups()
             expiry = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
             strike_val = float(strike_str) / 1000.0
-            strike_display = f"${strike_val:,.2f}"
             side = "Call" if type_char == 'C' else "Put"
-            return ticker, expiry, strike_display, side
+            return ticker, expiry, f"${strike_val:,.2f}", side
     except:
         pass
     return symbol, "-", "-", "-"
@@ -36,6 +35,7 @@ def parse_details(symbol):
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("🐋 FlowTrend AI")
+    st.caption("DEBUG MODE")
     page = st.radio("Navigate", ["🏠 Home", "🔍 Contract Inspector", "⚡ Live Whale Scanner"])
     st.divider()
     api_input = st.text_input("Polygon API Key", value=st.session_state["api_key"], type="password")
@@ -63,7 +63,6 @@ def render_inspector():
         st.subheader("1. Setup")
         target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
         
-        # Silent Price Check
         price = 0
         try:
             snap = client.get_snapshot_ticker("stocks", target)
@@ -142,10 +141,10 @@ def render_inspector():
             except: st.error("Data Load Error")
 
 # ==========================================
-# PAGE 3: LIVE SCANNER
+# PAGE 3: LIVE SCANNER (DEBUG MODE)
 # ==========================================
 def render_scanner():
-    st.title("⚡ Live Whale Stream")
+    st.title("⚡ Live Whale Stream (Debug Mode)")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
@@ -153,28 +152,26 @@ def render_scanner():
     def run_deep_scan(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Hunting individual whale trades (Deep Scan)...", expanded=True)
+        status = st.status("⏳ Starting Deep Scan...", expanded=True)
         
-        # --- FIX: REPLACE DEQUE INSTEAD OF CLEAR() ---
-        st.session_state["scanner_data"] = deque(maxlen=5000)
+        # We clear the old data
+        st.session_state["scanner_data"].clear()
 
         for t in tickers:
             try:
-                status.write(f"🔎 Scanning active contracts for {t}...")
+                status.write(f"🔎 Scanning active contracts for **{t}**...")
                 
                 # 1. Find the Hot Contracts (Snapshot)
-                # We limit to Top 20 contracts to keep API calls reasonable
                 chain = client.list_snapshot_options_chain(t, params={"limit": 20, "sort": "day_volume", "order": "desc"})
                 
                 hot_contracts = []
                 for c in chain:
                     if c.day and c.day.volume:
-                        # Only drill down if total volume implies activity
-                        if (c.day.volume * c.day.close * 100) > threshold:
-                            hot_contracts.append(c.details.ticker)
+                        hot_contracts.append(c.details.ticker)
                 
+                status.write(f"   --> Found {len(hot_contracts)} contracts. Drilling down...")
+
                 # 2. Fetch TRADE TAPE for each Hot Contract
-                # This gets the individual lines you want
                 for contract_sym in hot_contracts:
                     try:
                         # Get last 50 specific trades
@@ -182,6 +179,7 @@ def render_scanner():
                         
                         _, expiry, strike, side = parse_details(contract_sym)
                         
+                        count_found = 0
                         for tr in trades:
                             # Calculate Value of THIS specific trade
                             trade_val = tr.price * tr.size * 100
@@ -189,33 +187,37 @@ def render_scanner():
                             if trade_val >= threshold:
                                 ts = datetime.fromtimestamp(tr.participant_timestamp / 1e9).strftime('%H:%M:%S')
                                 
-                                # Tag Logic
                                 tag = "🧱 BLOCK"
                                 if tr.size > 2000: tag = "🐋 WHALE"
-                                elif tr.size < 5: tag = "⚠️ TINY"
                                 
                                 new_data.append({
                                     "Symbol": t,
                                     "Strike": strike,
                                     "Expiry": expiry,
                                     "Side": side,
-                                    "Trade Size": tr.size,      # Individual Size
-                                    "Trade Value": trade_val,   # Individual Value
+                                    "Trade Size": tr.size,      
+                                    "Trade Value": trade_val,   
                                     "Time": ts,
                                     "Tags": tag
                                 })
+                                count_found += 1
+                        
+                        if count_found > 0:
+                            status.write(f"   --> Found {count_found} big trades for {contract_sym}")
+                            
                     except: continue
                     
             except Exception as e:
+                status.error(f"Error scanning {t}: {e}")
                 continue
         
-        # Sort by Time Descending (Newest Trades First)
+        # Sort by Time
         new_data.sort(key=lambda x: x["Time"], reverse=True)
         
-        status.update(label=f"Scan Complete! Found {len(new_data)} specific trades.", state="complete", expanded=False)
+        status.update(label=f"Scan Complete! Found {len(new_data)} trades.", state="complete", expanded=False)
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET LISTENER ---
+    # --- 2. WEBSOCKET ---
     def start_listener(key, tickers, threshold):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
@@ -251,9 +253,10 @@ def render_scanner():
     # --- 3. CONTROLS ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
     with col2:
-        min_val = st.number_input("Min Trade Value ($)", value=20_000, step=10_000)
+        # LOW DEFAULT ($1000) TO TEST CONNECTION
+        min_val = st.number_input("Min Trade Value ($)", value=1000, step=1000)
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
