@@ -12,6 +12,12 @@ from collections import deque
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
+# --- 1. CRITICAL FIX: CLEAR OLD CACHE ON RELOAD ---
+# This prevents the KeyError by wiping old data formats
+if "init_done" not in st.session_state:
+    st.session_state.clear()
+    st.session_state["init_done"] = True
+
 # --- GLOBAL STATE ---
 if "scanner_data" not in st.session_state:
     st.session_state["scanner_data"] = deque(maxlen=2000)
@@ -26,8 +32,9 @@ def parse_details(symbol):
             ticker, date_str, type_char, strike_str = match.groups()
             expiry = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
             strike_val = float(strike_str) / 1000.0
+            strike_display = f"${strike_val:,.2f}"
             side = "Call" if type_char == 'C' else "Put"
-            return ticker, expiry, f"${strike_val:,.2f}", side
+            return ticker, expiry, strike_display, side
     except:
         pass
     return symbol, "-", "-", "-"
@@ -148,75 +155,67 @@ def render_scanner():
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. CRASH-PROOF DEEP MINER ---
-    def run_deep_miner(key, tickers, threshold):
+    # --- 1. DEEP TRADE SCANNER (INDIVIDUAL TRADES) ---
+    def run_deep_scan(key, tickers, threshold):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Mining individual trade tickets...", expanded=True)
+        status = st.status("⏳ Downloading trade tape (this finds individual blocks)...", expanded=True)
         
         for t in tickers:
             try:
-                status.write(f"⛏️ Digging into {t}...")
+                status.write(f"📥 Scanning Top Contracts for {t}...")
                 
-                # 1. FETCH BROAD SNAPSHOT (No Sorting Params to avoid 400 Error)
-                # We pull 500 contracts to ensure we catch the active ones
-                chain = client.list_snapshot_options_chain(t, params={"limit": 500})
+                # Step 1: Find Active Contracts (Snapshot)
+                # We fetch the Top 20 most active options for today
+                chain = client.list_snapshot_options_chain(t, params={"limit": 20, "sort": "day_volume", "order": "desc"})
                 
-                # 2. PYTHON SORT (Safety)
-                # We manually find the contracts with the highest volume TODAY
-                contract_list = []
+                hot_contracts = []
                 for c in chain:
                     if c.day and c.day.volume:
-                        contract_list.append(c)
+                        hot_contracts.append(c.details.ticker)
                 
-                # Sort by Volume Descending
-                contract_list.sort(key=lambda x: x.day.volume, reverse=True)
-                
-                # Pick the Top 15 Hottest Contracts to drill into
-                hot_contracts = [c.details.ticker for c in contract_list[:15]]
-                
-                status.write(f"🔎 Scanning Top 15 contracts for {t}...")
-
-                # 3. DRILL DOWN (Fetch Trades)
+                # Step 2: Fetch INDIVIDUAL TRADES for these contracts
                 for contract_sym in hot_contracts:
                     try:
+                        # Get last 50 trades
                         trades = client.list_trades(contract_sym, limit=50)
+                        
                         _, expiry, strike, side = parse_details(contract_sym)
                         
                         for tr in trades:
-                            # Individual Trade Value
-                            val = tr.price * tr.size * 100
+                            # Calculate VALUE of this specific trade
+                            trade_val = tr.price * tr.size * 100
                             
-                            if val >= threshold:
+                            if trade_val >= threshold:
                                 ts = datetime.fromtimestamp(tr.participant_timestamp / 1e9).strftime('%H:%M:%S')
+                                
+                                # Tag Logic
                                 tag = "🧱 BLOCK"
-                                if tr.size > 1000: tag = "🐋 WHALE"
+                                if tr.size > 2000: tag = "🐋 WHALE"
+                                elif tr.size < 10: tag = "⚠️ TINY"
                                 
                                 new_data.append({
                                     "Symbol": t,
                                     "Strike": strike,
                                     "Expiry": expiry,
                                     "Side": side,
-                                    "Trade Size": tr.size,      
-                                    "Trade Value": val,         
+                                    "Trade Size": tr.size,      # REAL Trade Size (e.g. 500)
+                                    "Trade Value": trade_val,   # REAL Trade Value ($125k)
                                     "Time": ts,
                                     "Tags": tag
                                 })
                     except: continue
                     
-            except Exception as e:
-                # Actually show the error this time so we know if it fails
-                status.warning(f"Error scanning {t}: {e}")
-                continue
+            except: continue
         
-        # Final Sort by Time
-        new_data.sort(key=lambda x: x["Time"], reverse=True)
+        # Sort by Value (Whales First)
+        new_data.sort(key=lambda x: x["Trade Value"], reverse=True)
         
-        status.update(label=f"Mining Complete! Found {len(new_data)} specific trades.", state="complete", expanded=False)
+        status.update(label=f"Done! Extracted {len(new_data)} individual trades.", state="complete", expanded=False)
         st.session_state["scanner_data"].clear()
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET ---
+    # --- 2. WEBSOCKET LISTENER ---
     def start_listener(key, tickers, threshold):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
@@ -252,13 +251,13 @@ def render_scanner():
     # --- 3. CONTROLS ---
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
     with col2:
         min_val = st.number_input("Min Trade Value ($)", value=20_000, step=10_000)
     with col3:
         st.write("") 
         if st.button("🔄 Start / Refresh"):
-            run_deep_miner(api_key, watch, min_val)
+            run_deep_scan(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -269,7 +268,7 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Sort by Value
+        # Force sort by Value
         df = df.sort_values(by="Trade Value", ascending=False)
         
         def style_rows(row):
@@ -288,7 +287,7 @@ def render_scanner():
             hide_index=True
         )
     else:
-        st.info("Click 'Start / Refresh' to mine trades.")
+        st.info("Click 'Start / Refresh' to hunt for whales.")
 
 # ==========================================
 # ROUTER
