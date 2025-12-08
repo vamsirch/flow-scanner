@@ -6,14 +6,15 @@ import threading
 import time
 import asyncio
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 import pytz
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
-# --- SAFETY: Reset State on Load to prevent KeyErrors ---
+# --- INITIALIZATION ---
+# Reset state to prevent "deque" errors from old sessions
 if "init_done" not in st.session_state:
     for key in list(st.session_state.keys()):
         del st.session_state[key]
@@ -46,66 +47,65 @@ def parse_details(symbol):
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("🐋 FlowTrend AI")
+    st.caption("Mode: 403 Bypass")
     page = st.radio("Navigate", ["🏠 Home", "🔍 Contract Inspector", "⚡ Live Whale Scanner"])
     st.divider()
     api_input = st.text_input("Polygon API Key", value=st.session_state["api_key"], type="password")
     if api_input: st.session_state["api_key"] = api_input.strip()
 
 # ==========================================
-# PAGE 1: HOME
+# PAGE 1 & 2
 # ==========================================
 def render_home():
     st.title("Welcome to FlowTrend Pro")
     st.info("Select a tool from the sidebar.")
 
-# ==========================================
-# PAGE 2: INSPECTOR
-# ==========================================
 def render_inspector():
     st.title("🔍 Contract Inspector")
-    st.info("Focus on the Scanner tab for now.")
+    st.info("Please focus on the Live Whale Scanner tab.")
 
 # ==========================================
-# PAGE 3: THE "NUCLEAR" SCANNER
+# PAGE 3: THE "SAFETY MODE" SCANNER
 # ==========================================
 def render_scanner():
-    st.title("⚡ Live Whale Stream (No Limits)")
+    st.title("⚡ Live Whale Stream (403 Bypass)")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. BACKFILL ENGINE ---
+    # --- 1. BACKFILL ENGINE (No Snapshots) ---
     def run_scan(key, tickers, min_val):
         client = RESTClient(key)
-        status = st.status("⏳ Starting scan...", expanded=True)
+        status = st.status("⏳ Starting scan (Bypass Mode)...", expanded=True)
         
-        # FIX 1: Use reassignment instead of .clear() to prevent crash
+        # FIX: Re-initialize deque instead of using .clear() to fix AttributeError
         st.session_state["scanner_data"] = deque(maxlen=10000)
         
         all_rows = []
 
         for t in tickers:
             try:
-                status.write(f"📥 Fetching contract list for {t}...")
+                status.write(f"📥 getting contract list for {t}...")
                 
-                # METHOD A: Try Snapshot (Fastest)
-                try:
-                    chain = client.list_snapshot_options_chain(t, params={"limit": 250})
-                    # Filter for ANY volume (Safe Check)
-                    active_contracts = []
-                    for c in chain:
-                        if c.day and c.day.volume is not None and c.day.volume > 0:
-                            active_contracts.append(c.details.ticker)
-                except:
-                    # METHOD B: Fallback if Snapshot fails (403 Error)
-                    status.warning(f"Snapshot failed for {t}, trying fallback method...")
-                    near_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-                    contracts = client.list_options_contracts(t, expiration_date_lte=near_date, limit=100)
-                    active_contracts = [c.ticker for c in contracts]
-
-                status.write(f"🔎 Scanning {len(active_contracts)} contracts for {t}...")
+                # METHOD: List Contracts (Allowed on all plans)
+                # We get contracts expiring in the next 45 days to keep it relevant
+                near_date = (datetime.now() + timedelta(days=45)).strftime("%Y-%m-%d")
                 
-                # Drill Down: Get Trades
-                for contract_sym in active_contracts:
+                # Fetch up to 250 contracts. This does NOT use the Snapshot endpoint.
+                contracts = client.list_options_contracts(
+                    underlying_ticker=t,
+                    expiration_date_lte=near_date,
+                    limit=250,
+                    sort="expiration_date",
+                    order="asc"
+                )
+                
+                # Extract symbols
+                target_contracts = [c.ticker for c in contracts]
+                
+                status.write(f"🔎 Scanning {len(target_contracts)} contracts for trades...")
+                
+                # Drill Down: Get Trades for each contract
+                for contract_sym in target_contracts:
                     try:
                         # Get last 50 trades
                         trades = client.list_trades(contract_sym, limit=50)
