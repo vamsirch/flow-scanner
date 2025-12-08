@@ -1,7 +1,10 @@
 import streamlit as st
 import pandas as pd
-from polygon import RESTClient
+from polygon import RESTClient, WebSocketClient
+from polygon.websocket.models import WebSocketMessage
+import threading
 import time
+import asyncio
 import re
 from datetime import datetime, timedelta
 from collections import deque
@@ -16,14 +19,16 @@ if "init_done" not in st.session_state:
     st.session_state["init_done"] = True
 
 if "scanner_data" not in st.session_state:
-    st.session_state["scanner_data"] = pd.DataFrame()
+    st.session_state["scanner_data"] = deque(maxlen=2000)
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
 # --- HELPERS ---
 def get_est_time(nanosecs):
+    """Converts milliseconds (aggregates use ms) to EST string"""
     try:
-        dt = datetime.fromtimestamp(nanosecs / 1e9, tz=pytz.utc)
+        # Aggregates timestamp is usually in milliseconds
+        dt = datetime.fromtimestamp(nanosecs / 1000, tz=pytz.utc)
         return dt.astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M:%S')
     except: return "00:00:00"
 
@@ -42,6 +47,7 @@ def parse_details(symbol):
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("🐋 FlowTrend AI")
+    st.caption("Mode: Aggregate Feed")
     page = st.radio("Navigate", ["🏠 Home", "🔍 Contract Inspector", "⚡ Live Whale Scanner"])
     st.divider()
     api_input = st.text_input("Polygon API Key", value=st.session_state["api_key"], type="password")
@@ -52,186 +58,157 @@ with st.sidebar:
 # ==========================================
 def render_home():
     st.title("Welcome to FlowTrend Pro")
-    st.info("Select a tool from the sidebar to begin.")
+    st.info("Select a tool from the sidebar.")
 
 # ==========================================
-# PAGE 2: INSPECTOR (Standard)
+# PAGE 2: CONTRACT INSPECTOR
 # ==========================================
 def render_inspector():
     st.title("🔍 Contract Inspector")
-    api_key = st.session_state["api_key"]
-    if not api_key: return st.error("Enter API Key.")
-    client = RESTClient(api_key)
-    
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        st.subheader("1. Setup")
-        target = st.selectbox("Ticker", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"])
-        
-        # Safe Price Check
-        try:
-            snap = client.get_snapshot_ticker("stocks", target)
-            price = snap.last_trade.price if snap.last_trade else snap.day.close
-            st.success(f"📍 {target}: ${price:.2f}")
-        except: st.warning("Price Unavailable")
-        
-        expiry = st.date_input("Expiration", value=datetime.now().date())
-        side = st.radio("Side", ["Call", "Put"], horizontal=True)
-        st.write("---")
-        
-        try:
-            contracts = client.list_options_contracts(target, expiry.strftime("%Y-%m-%d"), "call" if side=="Call" else "put", limit=1000)
-            strikes = sorted(list(set([c.strike_price for c in contracts])))
-            if strikes:
-                def_ix = min(range(len(strikes)), key=lambda i: abs(strikes[i]-(price if price else 0))) if strikes else 0
-                sel_strike = st.selectbox("Strike", strikes, index=def_ix)
-                d = expiry.strftime("%y%m%d")
-                t = "C" if side == "Call" else "P"
-                s = f"{int(sel_strike*1000):08d}"
-                final_sym = f"O:{target}{d}{t}{s}"
-                if st.button("Analyze"): st.session_state['active_sym'] = final_sym
-            else: st.error("No strikes found.")
-        except: st.error("API Error")
-
-    with c2:
-        if 'active_sym' in st.session_state:
-            sym = st.session_state['active_sym']
-            st.subheader(f"Analysis: {sym}")
-            try:
-                snap = client.get_snapshot_option(target, sym)
-                if snap:
-                    m1, m2, m3, m4 = st.columns(4)
-                    p = snap.last_trade.price if snap.last_trade else (snap.day.close if snap.day else 0)
-                    v = snap.day.volume if snap.day else 0
-                    m1.metric("Price", f"${p}", f"Vol: {v}")
-                    if snap.greeks:
-                        m2.metric("Delta", f"{snap.greeks.delta:.2f}")
-                        m3.metric("Gamma", f"{snap.greeks.gamma:.2f}")
-                    
-                    st.write("### ⚡ Price Chart")
-                    today = datetime.now().strftime("%Y-%m-%d")
-                    try:
-                        aggs = client.get_aggs(sym, 5, "minute", today, today)
-                        if aggs:
-                            df = pd.DataFrame(aggs)
-                            df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
-                            st.area_chart(df.set_index('Time')['close'], color="#00FF00")
-                        else: st.info("No trades today.")
-                    except: st.info("Chart Unavailable")
-            except: st.error("Data Load Error")
+    st.info("Please focus on the Live Whale Scanner tab.")
 
 # ==========================================
-# PAGE 3: ROBUST SCANNER (POLLING)
+# PAGE 3: AGGREGATE SCANNER (The Fix)
 # ==========================================
 def render_scanner():
-    st.title("⚡ Live Whale Stream")
+    st.title("⚡ Live Whale Stream (Aggregates)")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. THE DEEP SCAN ENGINE ---
-    def scan_market(key, tickers, threshold):
+    # --- 1. BACKFILL (Using 1-Min Aggregates) ---
+    def run_aggregate_backfill(key, tickers, min_val):
         client = RESTClient(key)
-        all_trades = []
-        status = st.status("🚀 Scanning Market...", expanded=True)
+        new_data = []
+        status = st.status("⏳ Downloading Aggregate History...", expanded=True)
         
+        st.session_state["scanner_data"].clear()
+
         for t in tickers:
             try:
-                status.write(f"📥 Getting active contracts for {t}...")
+                status.write(f"📥 Getting Active Contracts for {t}...")
+                # 1. Get Active Contracts
+                chain = client.list_snapshot_options_chain(t, params={"limit": 250})
                 
-                # 1. Get Snapshot of ALL contracts
-                # We pull 300 to be safe, sorted by volume descending (done in python for safety)
-                chain = client.list_snapshot_options_chain(t, params={"limit": 300})
-                
-                # Filter for active contracts (Handles the None Error)
                 active_contracts = []
                 for c in chain:
-                    # STRICT SAFETY CHECK: Ensure day, volume exist and > 0
                     if c.day and c.day.volume and c.day.volume > 0:
-                        active_contracts.append(c)
+                        active_contracts.append(c.details.ticker)
                 
-                # Sort by Volume (Highest first) to find where the action is
-                active_contracts.sort(key=lambda x: x.day.volume, reverse=True)
+                status.write(f"🔎 Aggregating flow for {len(active_contracts)} contracts...")
                 
-                # Take Top 25 Contracts to drill down into
-                targets = [c.details.ticker for c in active_contracts[:25]]
-                
-                status.write(f"🔎 Mining trades from {len(targets)} active contracts...")
-                
-                # 2. Get TRADE TAPE for these contracts
-                for sym in targets:
+                # 2. Get Aggregate Bars (1 Minute)
+                today = datetime.now().strftime("%Y-%m-%d")
+                for contract_sym in active_contracts:
                     try:
-                        # Get last 20 trades
-                        trades = client.list_trades(sym, limit=20)
-                        _, expiry, strike, side = parse_details(sym)
+                        # Get 1-minute bars for today
+                        aggs = client.get_aggs(contract_sym, 1, "minute", today, today)
+                        if not aggs: continue
                         
-                        for tr in trades:
-                            # Calculate Value
-                            val = tr.price * tr.size * 100
+                        _, expiry, strike, side = parse_details(contract_sym)
+                        
+                        for agg in aggs:
+                            # Use VWAP if available, else Close
+                            price = agg.vwap if agg.vwap else agg.close
+                            val = price * agg.volume * 100
                             
-                            # User Filter
-                            if val >= threshold:
-                                ts = get_est_time(tr.participant_timestamp)
+                            if val >= min_val:
+                                ts = get_est_time(agg.timestamp) # aggs use ms timestamp
                                 
-                                tag = "Block"
-                                if tr.size > 2000: tag = "🐋 WHALE"
-                                elif tr.size < 5: tag = "Small"
-                                
-                                all_trades.append({
-                                    "Symbol": t,
-                                    "Strike": strike,
-                                    "Expiry": expiry,
-                                    "Side": side,
-                                    "Trade Size": tr.size,
-                                    "Dollar Amount": val,
-                                    "Price": tr.price,
+                                new_data.append({
+                                    "Stock Symbol": t,
+                                    "Strike Price": strike,
+                                    "Call or Put": side,
+                                    "Agg Volume": agg.volume,   # Total Volume in this minute
+                                    "Agg Value": val,           # Total Value in this minute
                                     "Time": ts,
-                                    "Tags": tag
+                                    "Tags": "📊 1-Min Agg"
                                 })
                     except: continue
                     
             except Exception as e:
-                status.warning(f"Error on {t}: {e}")
                 continue
         
-        status.update(label=f"Done! Found {len(all_trades)} trades matching filters.", state="complete", expanded=False)
-        return pd.DataFrame(all_trades)
+        # Sort by Time
+        new_data.sort(key=lambda x: x["Time"], reverse=True)
+        
+        status.update(label=f"Done! Loaded {len(new_data)} aggregate blocks.", state="complete", expanded=False)
+        for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. CONTROLS ---
+    # --- 2. WEBSOCKET LISTENER (SECOND AGGREGATES) ---
+    def start_listener(key, tickers, min_val):
+        try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except: pass
+
+        def handle_msg(msgs: list[WebSocketMessage]):
+            for m in msgs:
+                # EVENT TYPE "A" = Second Aggregate (Not Trade)
+                if m.event_type == "A":
+                    try:
+                        found = next((t for t in tickers if t in m.symbol), None)
+                        if not found: continue
+
+                        # Aggregate Math: Volume * VWAP * 100
+                        # Note: 'm.volume' is the volume in that second
+                        # 'm.vwap' is the volume weighted average price
+                        price = m.vwap if m.vwap else m.close
+                        val = price * m.volume * 100
+                        
+                        if val >= min_val:
+                            _, _, strike, side = parse_details(m.symbol)
+                            # Timestamp in aggregates is 'start_timestamp' (ms)
+                            ts = get_est_time(m.start_timestamp)
+                            
+                            st.session_state["scanner_data"].appendleft({
+                                "Stock Symbol": found,
+                                "Strike Price": strike,
+                                "Call or Put": side,
+                                "Agg Volume": m.volume,
+                                "Agg Value": val,
+                                "Time": ts,
+                                "Tags": "⚡ 1-Sec Agg"
+                            })
+                    except: continue
+
+        # SUBSCRIBE TO "A.*" (Aggregates) INSTEAD OF "T.*"
+        ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["A.*"], verbose=False)
+        ws.run(handle_msg)
+
+    # --- 3. CONTROLS ---
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA", "AAPL", "AMD"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
     with c2:
-        min_val = st.number_input("Min Trade Value ($)", value=20000, step=10000)
+        # Default $10k
+        min_val = st.number_input("Min Aggregate Value ($)", value=10000, step=5000)
     with c3:
         st.write("")
-        # The button triggers the scan
-        if st.button("🔄 Scan Now"):
-            df = scan_market(api_key, watch, min_val)
-            st.session_state["scanner_data"] = df
+        if st.button("🚀 Start Aggregates"):
+            run_aggregate_backfill(api_key, watch, min_val)
+            if "thread_started" not in st.session_state:
+                st.session_state["thread_started"] = True
+                t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
+                t.start()
 
-    # --- 3. DISPLAY ---
-    df = st.session_state["scanner_data"]
-    
-    if not df.empty:
-        # Sort by Dollar Amount Descending (Biggest on Top)
-        df = df.sort_values(by="Dollar Amount", ascending=False)
+    # --- 4. DISPLAY ---
+    data = list(st.session_state["scanner_data"])
+    if len(data) > 0:
+        df = pd.DataFrame(data)
         
-        def style_rows(row):
-            c = '#d4f7d4' if row['Side'] == 'Call' else '#f7d4d4'
-            return [f'background-color: {c}; color: black'] * len(row)
-            
+        # Sort by Value
+        df = df.sort_values(by="Agg Value", ascending=False)
+        
         st.dataframe(
-            df.style.apply(style_rows, axis=1).format({"Dollar Amount": "${:,.0f}", "Price": "${:.2f}"}),
+            df,
             use_container_width=True,
             height=800,
             column_config={
-                "Dollar Amount": st.column_config.ProgressColumn("Trade Value", format="$%.0f", min_value=0, max_value=max(df["Dollar Amount"].max(), 100_000)),
-                "Trade Size": st.column_config.NumberColumn("Size", format="%d"),
+                "Agg Value": st.column_config.ProgressColumn("Total Value", format="$%.0f", min_value=0, max_value=max(df["Agg Value"].max(), 100_000)),
+                "Agg Volume": st.column_config.NumberColumn("Volume", format="%d"),
             },
             hide_index=True
         )
     else:
-        st.info("Click 'Scan Now' to pull the latest trades.")
+        st.info("Click 'Start Aggregates' to see flow.")
 
 # ==========================================
 # ROUTER
