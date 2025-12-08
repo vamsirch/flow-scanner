@@ -13,9 +13,10 @@ import pytz
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="FlowTrend Pro", layout="wide")
 
-# --- INITIALIZATION ---
+# --- SAFETY: Reset State on Load to prevent KeyErrors ---
 if "init_done" not in st.session_state:
-    st.session_state.clear()
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
     st.session_state["init_done"] = True
 
 if "scanner_data" not in st.session_state:
@@ -51,93 +52,101 @@ with st.sidebar:
     if api_input: st.session_state["api_key"] = api_input.strip()
 
 # ==========================================
-# PAGE 1 & 2
+# PAGE 1: HOME
 # ==========================================
 def render_home():
     st.title("Welcome to FlowTrend Pro")
     st.info("Select a tool from the sidebar.")
 
+# ==========================================
+# PAGE 2: INSPECTOR
+# ==========================================
 def render_inspector():
     st.title("🔍 Contract Inspector")
-    st.info("Please focus on the Live Whale Scanner tab.")
+    st.info("Focus on the Scanner tab for now.")
 
 # ==========================================
-# PAGE 3: UNLIMITED FIREHOSE SCANNER
+# PAGE 3: THE "NUCLEAR" SCANNER
 # ==========================================
 def render_scanner():
     st.title("⚡ Live Whale Stream (No Limits)")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. FIREHOSE BACKFILL (FIXED) ---
-    def run_firehose_backfill(key, tickers, min_val):
+    # --- 1. BACKFILL ENGINE ---
+    def run_scan(key, tickers, min_val):
         client = RESTClient(key)
-        status = st.status("⏳ Downloading trade tape...", expanded=True)
+        status = st.status("⏳ Starting scan...", expanded=True)
         
-        # FIX 1: REPLACE DEQUE INSTEAD OF CLEAR()
+        # FIX 1: Use reassignment instead of .clear() to prevent crash
         st.session_state["scanner_data"] = deque(maxlen=10000)
         
-        # Temp list to hold new data before sorting
-        all_new_rows = []
+        all_rows = []
 
         for t in tickers:
             try:
-                status.write(f"📥 Identifying Active Contracts for {t}...")
+                status.write(f"📥 Fetching contract list for {t}...")
                 
-                # 1. Get ALL Active Contracts
-                chain = client.list_snapshot_options_chain(t, params={"limit": 1000})
+                # METHOD A: Try Snapshot (Fastest)
+                try:
+                    chain = client.list_snapshot_options_chain(t, params={"limit": 250})
+                    # Filter for ANY volume (Safe Check)
+                    active_contracts = []
+                    for c in chain:
+                        if c.day and c.day.volume is not None and c.day.volume > 0:
+                            active_contracts.append(c.details.ticker)
+                except:
+                    # METHOD B: Fallback if Snapshot fails (403 Error)
+                    status.warning(f"Snapshot failed for {t}, trying fallback method...")
+                    near_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+                    contracts = client.list_options_contracts(t, expiration_date_lte=near_date, limit=100)
+                    active_contracts = [c.ticker for c in contracts]
+
+                status.write(f"🔎 Scanning {len(active_contracts)} contracts for {t}...")
                 
-                active_contracts = []
-                for c in chain:
-                    # FIX 2: STRICT NONE-TYPE CHECK
-                    # Prevents "TypeError: > not supported between NoneType and int"
-                    if c.day and c.day.volume is not None and c.day.volume > 0:
-                        active_contracts.append(c.details.ticker)
-                
-                status.write(f"🔎 Scanning {len(active_contracts)} active contracts for {t}...")
-                
-                # 2. Pull Trades for ALL Active Contracts
+                # Drill Down: Get Trades
                 for contract_sym in active_contracts:
                     try:
-                        # Get recent trades
+                        # Get last 50 trades
                         trades = client.list_trades(contract_sym, limit=50)
-                        
                         _, expiry, strike, side = parse_details(contract_sym)
                         
                         for tr in trades:
                             val = tr.price * tr.size * 100
                             
-                            # USER FILTER ONLY
+                            # Filter: Show everything above user limit
                             if val >= min_val:
                                 ts = get_est_time(tr.participant_timestamp)
                                 
                                 tag = "Block"
-                                if tr.size < 5: tag = "Small"
-                                elif tr.size > 1000: tag = "Whale"
+                                if tr.size > 2000: tag = "🐋 WHALE"
+                                elif tr.size < 5: tag = "Small"
                                 
-                                all_new_rows.append({
+                                all_rows.append({
                                     "Stock Symbol": t,
                                     "Strike Price": strike,
                                     "Call or Put": side,
-                                    "Contract Volume": tr.size, 
-                                    "Dollar Amount": val,       
+                                    "Contract Volume": tr.size,
+                                    "Dollar Amount": val,
                                     "Time": ts,
                                     "Tags": tag
                                 })
                     except: continue
                     
             except Exception as e:
-                print(f"Error on {t}: {e}")
+                print(f"Error: {e}")
                 continue
         
-        # Sort by Time (Newest First) and add to state
-        all_new_rows.sort(key=lambda x: x["Time"], reverse=True)
-        for row in all_new_rows:
-            st.session_state["scanner_data"].append(row)
+        # Sort newest first
+        all_rows.sort(key=lambda x: x["Time"], reverse=True)
         
-        status.update(label=f"Done! Loaded {len(all_new_rows)} trades.", state="complete", expanded=False)
+        # Update State
+        for row in all_rows:
+            st.session_state["scanner_data"].append(row)
+            
+        status.update(label=f"Done! Found {len(all_rows)} trades.", state="complete", expanded=False)
 
-    # --- 2. WEBSOCKET LISTENER ---
+    # --- 2. WEBSOCKET ---
     def start_listener(key, tickers, min_val):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
@@ -171,13 +180,14 @@ def render_scanner():
     # --- 3. CONTROLS ---
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "IWM"], default=["NVDA", "TSLA"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
     with c2:
-        min_val = st.number_input("Filter: Min Trade Value ($)", value=5000, step=1000)
+        # Default 0 to see EVERYTHING first
+        min_val = st.number_input("Min Trade Value ($)", value=0, step=1000)
     with c3:
         st.write("")
-        if st.button("🚀 Start Firehose"):
-            run_firehose_backfill(api_key, watch, min_val)
+        if st.button("🚀 Start Scan"):
+            run_scan(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -188,7 +198,7 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Sort by Dollar Amount (Largest First)
+        # Sort by Dollar Amount
         df = df.sort_values(by="Dollar Amount", ascending=False)
         
         def style_rows(row):
@@ -206,7 +216,7 @@ def render_scanner():
             hide_index=True
         )
     else:
-        st.info("Click 'Start Firehose' to pull data.")
+        st.info("Click 'Start Scan' to pull data.")
 
 # ==========================================
 # ROUTER
