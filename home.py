@@ -7,7 +7,7 @@ import time
 import asyncio
 import re
 from datetime import datetime
-from collections import deque, defaultdict
+from collections import deque
 import pytz
 
 # --- PAGE CONFIG ---
@@ -19,7 +19,8 @@ if "init_done" not in st.session_state:
     st.session_state["init_done"] = True
 
 if "scanner_data" not in st.session_state:
-    st.session_state["scanner_data"] = deque(maxlen=2000)
+    # Increased buffer to 10,000 rows
+    st.session_state["scanner_data"] = deque(maxlen=10000)
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
@@ -45,11 +46,10 @@ def parse_details(symbol):
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("🐋 FlowTrend AI")
-    st.caption("Mode: Synthetic Aggregates")
     page = st.radio("Navigate", ["🏠 Home", "🔍 Contract Inspector", "⚡ Live Whale Scanner"])
     st.divider()
     api_input = st.text_input("Polygon API Key", value=st.session_state["api_key"], type="password")
-    if api_input: st.session_state["api_key"] = api_input
+    if api_input: st.session_state["api_key"] = api_input.strip()
 
 # ==========================================
 # PAGE 1 & 2
@@ -63,93 +63,94 @@ def render_inspector():
     st.info("Please focus on the Live Whale Scanner tab.")
 
 # ==========================================
-# PAGE 3: SYNTHETIC AGGREGATE SCANNER
+# PAGE 3: UNLIMITED FIREHOSE SCANNER
 # ==========================================
 def render_scanner():
-    st.title("⚡ Live Whale Stream (Aggregates)")
+    st.title("⚡ Live Whale Stream (No Limits)")
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. BACKFILL (Using Synthetic Aggregation) ---
-    def run_aggregate_backfill(key, tickers, min_val):
+    # --- 1. FIREHOSE BACKFILL (FIXED ERROR HANDLING) ---
+    def run_firehose_backfill(key, tickers, min_val):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Aggregating trade flow...", expanded=True)
+        status = st.status("⏳ Downloading trade tape...", expanded=True)
         
-        st.session_state["scanner_data"].clear()
+        # FIX 1: Safe Clear (Re-assign new deque instead of .clear())
+        st.session_state["scanner_data"] = deque(maxlen=10000)
 
         for t in tickers:
             try:
-                status.write(f"📥 Scanning active contracts for {t}...")
+                status.write(f"📥 Getting Active Contracts for {t}...")
                 
-                # 1. Get Active Contracts (Snapshot)
-                chain = client.list_snapshot_options_chain(t, params={"limit": 250})
+                # 1. Get ALL Active Contracts
+                # We pull a large list (limit=1000) to ensure we see everything
+                chain = client.list_snapshot_options_chain(t, params={"limit": 1000})
                 
+                # Filter for contracts that actually traded today
                 active_contracts = []
                 for c in chain:
-                    if c.day and c.day.volume and c.day.volume > 0:
+                    # FIX 2: STRICT NONE-TYPE CHECK
+                    # We check if c.day exists AND if volume is not None AND if volume > 0
+                    if c.day and c.day.volume is not None and c.day.volume > 0:
                         active_contracts.append(c.details.ticker)
                 
-                # 2. Fetch TRADES but GROUP them
+                status.write(f"🔎 Scanning {len(active_contracts)} active contracts for {t}...")
+                
+                # 2. Pull Trades for ALL Active Contracts
+                # Loop through every single contract found
                 for contract_sym in active_contracts:
                     try:
-                        # Get trades (Raw Data)
-                        trades = client.list_trades(contract_sym, limit=100)
+                        # Get recent trades
+                        trades = client.list_trades(contract_sym, limit=50)
+                        
                         _, expiry, strike, side = parse_details(contract_sym)
                         
-                        # GROUP BY MINUTE (Synthetic Aggregation)
-                        # We use a dictionary to sum volume/value for each minute
-                        grouped = defaultdict(lambda: {'vol': 0, 'val': 0, 'count': 0})
-                        
                         for tr in trades:
-                            # Round timestamp to nearest MINUTE (60 seconds)
-                            ts_min = int(tr.participant_timestamp / 1e9) // 60 * 60
                             val = tr.price * tr.size * 100
                             
-                            grouped[ts_min]['vol'] += tr.size
-                            grouped[ts_min]['val'] += val
-                            grouped[ts_min]['count'] += 1
-                        
-                        # Process Groups
-                        for ts_min, data in grouped.items():
-                            if data['val'] >= min_val:
-                                ts_str = datetime.fromtimestamp(ts_min, tz=pytz.utc).astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M')
+                            # USER FILTER ONLY
+                            if val >= min_val:
+                                ts = get_est_time(tr.participant_timestamp)
+                                
+                                tag = "Block"
+                                if tr.size < 10: tag = "Small"
+                                elif tr.size > 1000: tag = "Whale"
                                 
                                 new_data.append({
                                     "Stock Symbol": t,
                                     "Strike Price": strike,
                                     "Call or Put": side,
-                                    "Agg Volume": data['vol'],   # Sum of volume
-                                    "Agg Value": data['val'],    # Sum of value
-                                    "Trade Count": data['count'],
-                                    "Time": ts_str,
-                                    "Tags": "🧱 Aggregate"
+                                    "Contract Volume": tr.size, 
+                                    "Dollar Amount": val,       
+                                    "Time": ts,
+                                    "Tags": tag
                                 })
                     except: continue
                     
             except Exception as e:
+                # Log error safely
+                print(f"Error on {t}: {e}")
                 continue
         
-        # Sort by Time
+        # Sort by Time (Newest First)
         new_data.sort(key=lambda x: x["Time"], reverse=True)
         
-        status.update(label=f"Done! Created {len(new_data)} aggregated blocks.", state="complete", expanded=False)
+        status.update(label=f"Done! Loaded {len(new_data)} trades.", state="complete", expanded=False)
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET LISTENER (Live Synthetic Agg) ---
+    # --- 2. WEBSOCKET LISTENER ---
     def start_listener(key, tickers, min_val):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
 
         def handle_msg(msgs: list[WebSocketMessage]):
             for m in msgs:
-                if m.event_type == "T": # Listen to TRADES
+                if m.event_type == "T":
                     try:
                         found = next((t for t in tickers if t in m.symbol), None)
                         if not found: continue
 
-                        # We just display significant trades as they come in.
-                        # Real-time aggregation is hard, so we show big blocks live.
                         val = m.price * m.size * 100
                         
                         if val >= min_val:
@@ -160,11 +161,10 @@ def render_scanner():
                                 "Stock Symbol": found,
                                 "Strike Price": strike,
                                 "Call or Put": side,
-                                "Agg Volume": m.size,
-                                "Agg Value": val,
-                                "Trade Count": 1,
+                                "Contract Volume": m.size,
+                                "Dollar Amount": val,
                                 "Time": ts,
-                                "Tags": "⚡ Live Block"
+                                "Tags": "⚡ Live"
                             })
                     except: continue
 
@@ -176,12 +176,12 @@ def render_scanner():
     with c1:
         watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
     with c2:
-        # Default $10k
-        min_val = st.number_input("Min Aggregate Value ($)", value=10000, step=5000)
+        # Default Filter (Set to 0 to see EVERYTHING)
+        min_val = st.number_input("Filter: Min Trade Value ($)", value=5000, step=1000)
     with c3:
         st.write("")
-        if st.button("🚀 Start Aggregates"):
-            run_aggregate_backfill(api_key, watch, min_val)
+        if st.button("🚀 Start Firehose"):
+            run_firehose_backfill(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -192,22 +192,25 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Sort by Value
-        df = df.sort_values(by="Agg Value", ascending=False)
+        # Sort by Dollar Amount (Largest First)
+        df = df.sort_values(by="Dollar Amount", ascending=False)
         
+        def style_rows(row):
+            c = '#d4f7d4' if row['Call or Put'] == 'Call' else '#f7d4d4'
+            return [f'background-color: {c}; color: black'] * len(row)
+
         st.dataframe(
-            df,
+            df.style.apply(style_rows, axis=1),
             use_container_width=True,
             height=800,
             column_config={
-                "Agg Value": st.column_config.ProgressColumn("Total Value", format="$%.0f", min_value=0, max_value=max(df["Agg Value"].max(), 100_000)),
-                "Agg Volume": st.column_config.NumberColumn("Volume", format="%d"),
-                "Trade Count": st.column_config.NumberColumn("Trades", format="%d"),
+                "Dollar Amount": st.column_config.ProgressColumn("Trade Value", format="$%.0f", min_value=0, max_value=max(df["Dollar Amount"].max(), 100_000)),
+                "Contract Volume": st.column_config.NumberColumn("Size", format="%d"),
             },
             hide_index=True
         )
     else:
-        st.info("Click 'Start Aggregates' to load data.")
+        st.info("Click 'Start Firehose' to pull data.")
 
 # ==========================================
 # ROUTER
