@@ -19,7 +19,6 @@ if "init_done" not in st.session_state:
     st.session_state["init_done"] = True
 
 if "scanner_data" not in st.session_state:
-    # Increased buffer to 10,000 rows
     st.session_state["scanner_data"] = deque(maxlen=10000)
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
@@ -63,45 +62,50 @@ def render_inspector():
     st.info("Please focus on the Live Whale Scanner tab.")
 
 # ==========================================
-# PAGE 3: UNLIMITED FIREHOSE SCANNER
+# PAGE 3: BRUTE FORCE SCANNER
 # ==========================================
 def render_scanner():
-    st.title("⚡ Live Whale Stream (No Limits)")
+    st.title("⚡ Live Whale Stream (Brute Force)")
+    st.caption("Scans EVERY active contract. Slower, but guaranteed to find trades.")
+    
     api_key = st.session_state["api_key"]
     if not api_key: return st.error("Enter API Key.")
 
-    # --- 1. FIREHOSE BACKFILL (FIXED ERROR HANDLING) ---
-    def run_firehose_backfill(key, tickers, min_val):
+    # --- 1. BRUTE FORCE BACKFILL ---
+    def run_brute_force(key, tickers, min_val):
         client = RESTClient(key)
         new_data = []
-        status = st.status("⏳ Downloading trade tape...", expanded=True)
+        status = st.status("⏳ Casting wide net (this takes a moment)...", expanded=True)
         
-        # FIX 1: Safe Clear (Re-assign new deque instead of .clear())
+        # Clear old data
         st.session_state["scanner_data"] = deque(maxlen=10000)
 
         for t in tickers:
             try:
-                status.write(f"📥 Getting Active Contracts for {t}...")
+                status.write(f"📥 Fetching ALL contracts for {t}...")
                 
-                # 1. Get ALL Active Contracts
-                # We pull a large list (limit=1000) to ensure we see everything
+                # 1. Get entire chain (Limit 1000 covers almost all active weekly contracts)
                 chain = client.list_snapshot_options_chain(t, params={"limit": 1000})
                 
-                # Filter for contracts that actually traded today
+                # 2. Filter: Keep ANY contract that traded today
                 active_contracts = []
                 for c in chain:
-                    # FIX 2: STRICT NONE-TYPE CHECK
-                    # We check if c.day exists AND if volume is not None AND if volume > 0
                     if c.day and c.day.volume is not None and c.day.volume > 0:
                         active_contracts.append(c.details.ticker)
                 
-                status.write(f"🔎 Scanning {len(active_contracts)} active contracts for {t}...")
+                status.write(f"🔎 Found {len(active_contracts)} active contracts for {t}. Checking trade tapes...")
                 
-                # 2. Pull Trades for ALL Active Contracts
-                # Loop through every single contract found
-                for contract_sym in active_contracts:
+                # 3. Pull Trades for ALL of them (No "Top 20" limit)
+                # This guarantees we see everything.
+                progress_bar = status.progress(0)
+                total_contracts = len(active_contracts)
+                
+                for idx, contract_sym in enumerate(active_contracts):
+                    # Update progress bar every 10 contracts to save UI updates
+                    if idx % 10 == 0: progress_bar.progress((idx + 1) / total_contracts)
+                    
                     try:
-                        # Get recent trades
+                        # Get last 50 trades per contract
                         trades = client.list_trades(contract_sym, limit=50)
                         
                         _, expiry, strike, side = parse_details(contract_sym)
@@ -109,12 +113,12 @@ def render_scanner():
                         for tr in trades:
                             val = tr.price * tr.size * 100
                             
-                            # USER FILTER ONLY
+                            # Filter
                             if val >= min_val:
                                 ts = get_est_time(tr.participant_timestamp)
                                 
                                 tag = "Block"
-                                if tr.size < 10: tag = "Small"
+                                if tr.size < 5: tag = "Small"
                                 elif tr.size > 1000: tag = "Whale"
                                 
                                 new_data.append({
@@ -129,14 +133,13 @@ def render_scanner():
                     except: continue
                     
             except Exception as e:
-                # Log error safely
                 print(f"Error on {t}: {e}")
                 continue
         
-        # Sort by Time (Newest First)
+        # Sort by Time
         new_data.sort(key=lambda x: x["Time"], reverse=True)
         
-        status.update(label=f"Done! Loaded {len(new_data)} trades.", state="complete", expanded=False)
+        status.update(label=f"Done! Loaded {len(new_data)} individual trades.", state="complete", expanded=False)
         for row in new_data: st.session_state["scanner_data"].append(row)
 
     # --- 2. WEBSOCKET LISTENER ---
@@ -174,14 +177,14 @@ def render_scanner():
     # --- 3. CONTROLS ---
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
+        watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA"])
     with c2:
-        # Default Filter (Set to 0 to see EVERYTHING)
-        min_val = st.number_input("Filter: Min Trade Value ($)", value=5000, step=1000)
+        # Defaults to $0 so you see EVERYTHING first. Then increase it.
+        min_val = st.number_input("Filter: Min Value ($)", value=0, step=1000)
     with c3:
         st.write("")
-        if st.button("🚀 Start Firehose"):
-            run_firehose_backfill(api_key, watch, min_val)
+        if st.button("🚀 Start Scan"):
+            run_brute_force(api_key, watch, min_val)
             if "thread_started" not in st.session_state:
                 st.session_state["thread_started"] = True
                 t = threading.Thread(target=start_listener, args=(api_key, watch, min_val), daemon=True)
@@ -192,7 +195,7 @@ def render_scanner():
     if len(data) > 0:
         df = pd.DataFrame(data)
         
-        # Sort by Dollar Amount (Largest First)
+        # Sort by Value Descending
         df = df.sort_values(by="Dollar Amount", ascending=False)
         
         def style_rows(row):
@@ -210,7 +213,7 @@ def render_scanner():
             hide_index=True
         )
     else:
-        st.info("Click 'Start Firehose' to pull data.")
+        st.info("Click 'Start Scan' to pull data. (Filter is $0 to guarantee results)")
 
 # ==========================================
 # ROUTER
