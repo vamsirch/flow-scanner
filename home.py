@@ -6,7 +6,7 @@ import threading
 import time
 import asyncio
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque, defaultdict
 import pytz
 
@@ -93,26 +93,27 @@ def render_scanner():
                 # 2. Fetch TRADES but GROUP them
                 for contract_sym in active_contracts:
                     try:
-                        # Get trades
-                        trades = client.list_trades(contract_sym, limit=50)
+                        # Get trades (Raw Data)
+                        trades = client.list_trades(contract_sym, limit=100)
                         _, expiry, strike, side = parse_details(contract_sym)
                         
-                        # GROUP BY SECOND
+                        # GROUP BY MINUTE (Synthetic Aggregation)
+                        # We use a dictionary to sum volume/value for each minute
                         grouped = defaultdict(lambda: {'vol': 0, 'val': 0, 'count': 0})
                         
                         for tr in trades:
-                            # Round timestamp to nearest second
-                            ts_sec = int(tr.participant_timestamp / 1e9) 
+                            # Round timestamp to nearest MINUTE (60 seconds)
+                            ts_min = int(tr.participant_timestamp / 1e9) // 60 * 60
                             val = tr.price * tr.size * 100
                             
-                            grouped[ts_sec]['vol'] += tr.size
-                            grouped[ts_sec]['val'] += val
-                            grouped[ts_sec]['count'] += 1
+                            grouped[ts_min]['vol'] += tr.size
+                            grouped[ts_min]['val'] += val
+                            grouped[ts_min]['count'] += 1
                         
                         # Process Groups
-                        for ts_sec, data in grouped.items():
+                        for ts_min, data in grouped.items():
                             if data['val'] >= min_val:
-                                ts_str = datetime.fromtimestamp(ts_sec, tz=pytz.utc).astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M:%S')
+                                ts_str = datetime.fromtimestamp(ts_min, tz=pytz.utc).astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M')
                                 
                                 new_data.append({
                                     "Stock Symbol": t,
@@ -132,44 +133,42 @@ def render_scanner():
         # Sort by Time
         new_data.sort(key=lambda x: x["Time"], reverse=True)
         
-        status.update(label=f"Done! Created {len(new_data)} aggregate blocks.", state="complete", expanded=False)
+        status.update(label=f"Done! Created {len(new_data)} aggregated blocks.", state="complete", expanded=False)
         for row in new_data: st.session_state["scanner_data"].append(row)
 
-    # --- 2. WEBSOCKET LISTENER (AGGREGATE CHANNEL) ---
+    # --- 2. WEBSOCKET LISTENER (Live Synthetic Agg) ---
     def start_listener(key, tickers, min_val):
         try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except: pass
 
         def handle_msg(msgs: list[WebSocketMessage]):
             for m in msgs:
-                # Use "A" (Second Agg) channel for live feed
-                if m.event_type == "A":
+                if m.event_type == "T": # Listen to TRADES
                     try:
                         found = next((t for t in tickers if t in m.symbol), None)
                         if not found: continue
 
-                        # Calculate Value (VWAP * Vol * 100)
-                        price = m.vwap if m.vwap else m.close
-                        val = price * m.volume * 100
+                        # We just display significant trades as they come in.
+                        # Real-time aggregation is hard, so we show big blocks live.
+                        val = m.price * m.size * 100
                         
                         if val >= min_val:
                             _, _, strike, side = parse_details(m.symbol)
-                            ts = get_est_time(m.start_timestamp * 1000000) # ms to ns
+                            ts = get_est_time(m.participant_timestamp)
                             
                             st.session_state["scanner_data"].appendleft({
                                 "Stock Symbol": found,
                                 "Strike Price": strike,
                                 "Call or Put": side,
-                                "Agg Volume": m.volume,
+                                "Agg Volume": m.size,
                                 "Agg Value": val,
-                                "Trade Count": m.transactions, # Number of trades in this agg
+                                "Trade Count": 1,
                                 "Time": ts,
-                                "Tags": "⚡ Live Agg"
+                                "Tags": "⚡ Live Block"
                             })
                     except: continue
 
-        # Subscribe to Second Aggregates (A.*)
-        ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["A.*"], verbose=False)
+        ws = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
         ws.run(handle_msg)
 
     # --- 3. CONTROLS ---
@@ -177,6 +176,7 @@ def render_scanner():
     with c1:
         watch = st.multiselect("Watchlist", ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT"], default=["NVDA", "TSLA"])
     with c2:
+        # Default $10k
         min_val = st.number_input("Min Aggregate Value ($)", value=10000, step=5000)
     with c3:
         st.write("")
